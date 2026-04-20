@@ -1389,6 +1389,9 @@ bool StreamElementsSceneItemsMonitor::InvokeCurrentSceneItemDefaultContextMenu(
 
 void StreamElementsSceneItemsMonitor::UpdateSceneItemsToolbar()
 {
+	if (!m_sceneItemsToolBar)
+		return;
+
 	if (!IsSupportedOBSVersion())
 		return;
 
