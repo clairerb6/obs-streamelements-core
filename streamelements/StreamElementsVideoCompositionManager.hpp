@@ -2,12 +2,18 @@
 
 #include "StreamElementsVideoComposition.hpp"
 #include <shared_mutex>
+#include <string>
+#include <map>
+#include "cef-headers.hpp"
 
 class StreamElementsVideoCompositionManager {
 private:
 	std::shared_mutex m_mutex;
 	std::map<std::string, std::shared_ptr<StreamElementsVideoCompositionBase>> m_videoCompositionsMap;
 	std::shared_ptr<StreamElementsVideoCompositionBase> m_nativeVideoComposition;
+
+	std::map<std::string, CefRefPtr<CefDictionaryValue>>
+		m_availableEncoderClassesCache;
 
 public:
 	StreamElementsVideoCompositionManager();

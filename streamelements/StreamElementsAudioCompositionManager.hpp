@@ -5,8 +5,11 @@
 #include <obs.h>
 #include <obs.hpp>
 #include <obs-frontend-api.h>
+#include "cef-headers.hpp"
 #include "StreamElementsUtils.hpp"
 
+#include <string>
+#include <map>
 #include <shared_mutex>
 
 class StreamElementsAudioCompositionManager {
@@ -17,6 +20,9 @@ private:
 		m_audioCompositionsMap;
 	std::shared_ptr<StreamElementsAudioCompositionBase>
 		m_nativeAudioComposition;
+
+	std::map<std::string, CefRefPtr<CefDictionaryValue>>
+		m_availableEncoderClassesCache;
 
 public:
 	StreamElementsAudioCompositionManager();

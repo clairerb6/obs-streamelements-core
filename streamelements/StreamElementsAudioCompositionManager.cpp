@@ -212,12 +212,20 @@ void StreamElementsAudioCompositionManager::RemoveCompositionsByIds(
 void StreamElementsAudioCompositionManager::SerializeAvailableEncoderClasses(
 	obs_encoder_type type, CefRefPtr<CefValue> &output)
 {
+	std::unique_lock<decltype(m_mutex)> lock(m_mutex);
+
 	auto root = CefListValue::Create();
 
 	const char *id;
 	for (size_t i = 0; obs_enum_encoder_types(i, &id); ++i) {
 		if (obs_get_encoder_type(id) != type)
 			continue;
+
+		if (m_availableEncoderClassesCache.count(id)) {
+			root->SetDictionary(root->GetSize(),
+					    m_availableEncoderClassesCache[id]);
+			continue;
+		}
 
 		auto d = CefDictionaryValue::Create();
 
@@ -249,6 +257,8 @@ void StreamElementsAudioCompositionManager::SerializeAvailableEncoderClasses(
 
 			obs_encoder_release(SETRACE_DECREF(encoder));
 		}
+
+		m_availableEncoderClassesCache[id] = d;
 
 		root->SetDictionary(root->GetSize(), d);
 	}

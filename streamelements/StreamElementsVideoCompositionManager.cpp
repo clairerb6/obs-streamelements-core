@@ -298,6 +298,8 @@ void StreamElementsVideoCompositionManager::SerializeAvailableEncoderClasses(
 	obs_encoder_type type,
 	CefRefPtr<CefValue>& output)
 {
+	std::unique_lock<decltype(m_mutex)> lock(m_mutex);
+
 	auto root = CefListValue::Create();
 
 	const char *id;
@@ -309,6 +311,12 @@ void StreamElementsVideoCompositionManager::SerializeAvailableEncoderClasses(
 
 		if (caps & OBS_ENCODER_CAP_INTERNAL)
 			continue;
+
+		if (m_availableEncoderClassesCache.count(id)) {
+			root->SetDictionary(root->GetSize(),
+					    m_availableEncoderClassesCache[id]);
+			continue;
+		}
 
 		auto d = CefDictionaryValue::Create();
 
@@ -342,6 +350,8 @@ void StreamElementsVideoCompositionManager::SerializeAvailableEncoderClasses(
 
 			obs_encoder_release(SETRACE_DECREF(encoder));
 		}
+
+		m_availableEncoderClassesCache[id] = d;
 
 		root->SetDictionary(root->GetSize(), d);
 	}
