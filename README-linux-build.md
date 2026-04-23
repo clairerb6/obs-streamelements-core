@@ -1,4 +1,184 @@
-# Linux Build Notes (Fase Usable)
+# Linux Build Notes / Notas de Build Linux
+
+This file is available in both languages:
+1. English (first)
+2. Español (below)
+
+---
+
+## English
+
+# Linux Build Notes (Usable Phase)
+
+This document summarizes the Linux migration phase for `obs-streamelements-core`.
+
+It includes:
+- Packages/libraries installed during this phase.
+- Recommended minimum dependencies for building.
+- Usage of the `_scripts/build-linux.sh` helper script.
+
+## Scope
+
+Tested on:
+- Fedora 43
+- OBS 32.1.x
+- Qt 6
+
+Validated flow:
+- Plugin compiled and integrated as a module in a Linux environment.
+- Real streaming tests with both horizontal and vertical scenes.
+
+## Packages Installed in This Phase (Fedora)
+
+During migration, these packages were installed or validated on the system:
+
+- `obs-studio-devel`
+- `qt6-qttools-devel`
+- `qt6-designer`
+- `qt6-linguist`
+- `qt6-doctools`
+- `qt6-doc-devel`
+- `extra-cmake-modules`
+- `libavutil-free-devel`
+- `libswresample-free-devel`
+- `libavcodec-free-devel`
+- `libavformat-free-devel`
+- `libswscale-free-devel`
+- `libpostproc-free-devel`
+- `libavfilter-free-devel`
+- `swig`
+- `vlc-devel`
+
+Note: some packages were installed automatically as `dnf` dependencies.
+
+## Recommended Minimum Dependencies (Fedora)
+
+For a clean build from scratch, we recommend at least:
+
+```bash
+sudo dnf install \
+  git cmake ninja-build gcc gcc-c++ make pkgconf-pkg-config \
+  obs-studio-devel \
+  qt6-qtbase-devel qt6-qttools-devel \
+  curl-devel swig vlc-devel \
+  libavutil-free-devel libswresample-free-devel libavcodec-free-devel \
+  libavformat-free-devel libswscale-free-devel libpostproc-free-devel \
+  libavfilter-free-devel
+```
+
+If you build `obs-studio` from source, also install the dependencies recommended by OBS for your distro.
+
+## Known Conflicts (Fedora + RPMFusion)
+
+During this phase, a common conflict appeared between Fedora FFmpeg variants (`*-free`) and RPMFusion `ffmpeg-libs` while trying to install `x264`:
+
+- Conflict between `libswscale-free` and `ffmpeg-libs`.
+
+Recommendation:
+- Do not mix FFmpeg stacks without reviewing package replacements first.
+- Keep one consistent package family on the build machine.
+
+## Build Script
+
+Path:
+
+- `_scripts/build-linux.sh`
+
+Permissions:
+
+```bash
+chmod +x _scripts/build-linux.sh
+```
+
+### Basic usage
+
+```bash
+./_scripts/build-linux.sh
+```
+
+### Clean build
+
+```bash
+./_scripts/build-linux.sh --clean
+```
+
+### Build + install into OBS user plugin directory
+
+```bash
+./_scripts/build-linux.sh --clean --install-user
+```
+
+This copies:
+- `.so` binary to `~/.config/obs-studio/plugins/obs-streamelements-core/bin/64bit/`
+- Plugin data to `~/.config/obs-studio/plugins/obs-streamelements-core/data/obs-plugins/obs-streamelements-core/`
+
+### Help
+
+```bash
+./_scripts/build-linux.sh --help
+```
+
+## Script options
+
+- `--build-dir <path>`: build directory.
+- `--build-type <type>`: CMake build type (`RelWithDebInfo`, `Release`, etc).
+- `--generator <name>`: CMake generator (default: `Ninja`).
+- `--target <name>`: build target (default: `obs-streamelements-core`).
+- `--jobs <n>`: build parallelism.
+- `--clean`: remove build directory before configure.
+- `--no-configure`: skip `cmake -S/-B` and only build.
+- `--configure-only`: configure only, do not build.
+- `--cmake-arg <arg>`: extra CMake configure argument (repeatable).
+- `--install-user`: install compiled plugin in OBS user profile.
+- `--user-plugin-dir <path>`: base plugin install path.
+
+## Useful examples
+
+CI build in separate directory:
+
+```bash
+./_scripts/build-linux.sh \
+  --build-dir ./build-ci \
+  --build-type RelWithDebInfo \
+  --jobs 2
+```
+
+Compile without reconfiguring:
+
+```bash
+./_scripts/build-linux.sh --no-configure --jobs 1
+```
+
+Force compiler:
+
+```bash
+./_scripts/build-linux.sh \
+  --clean \
+  --cmake-arg -DCMAKE_C_COMPILER=clang \
+  --cmake-arg -DCMAKE_CXX_COMPILER=clang++
+```
+
+## GitHub Actions Integration (later)
+
+This script was designed to be reusable from CI. Recommended flow:
+
+1. Checkout repository.
+2. Install Linux runner dependencies.
+3. Run `_scripts/build-linux.sh --clean --build-dir ./build-ci`.
+4. Publish `obs-streamelements-core.so` as an artifact.
+
+## Phase status
+
+- Current status: **usable** on Linux.
+- Pending work before “stable” status:
+  - reduce remaining warnings.
+  - continue auditing intermittent leaks reported during OBS shutdown.
+
+---
+
+## Español
+
+# Notas de Build Linux (Fase Usable)
 
 Este documento resume la fase de migración Linux de `obs-streamelements-core`.
 
@@ -14,7 +194,7 @@ Probado en:
 - OBS 32.1.x
 - Qt 6
 
-Flujo usado:
+Flujo validado:
 - Plugin compilado e integrado como módulo en entorno Linux.
 - Pruebas reales de streaming con escenas horizontal + vertical.
 
@@ -62,11 +242,11 @@ Si trabajas con `obs-studio` desde source, instala además las dependencias indi
 
 Durante esta fase apareció un conflicto típico entre variantes FFmpeg de Fedora (`*-free`) y `ffmpeg-libs` de RPMFusion al intentar instalar `x264`:
 
-- conflicto entre `libswscale-free` y `ffmpeg-libs`
+- Conflicto entre `libswscale-free` y `ffmpeg-libs`.
 
 Recomendación:
-- no mezclar stacks FFmpeg sin revisar reemplazos.
-- preferir mantener consistente una sola familia de paquetes en la máquina de build.
+- No mezclar stacks FFmpeg sin revisar reemplazos.
+- Preferir mantener consistente una sola familia de paquetes en la máquina de build.
 
 ## Script de Build
 
@@ -99,8 +279,8 @@ chmod +x _scripts/build-linux.sh
 ```
 
 Esto copia:
-- binario `.so` a `~/.config/obs-studio/plugins/obs-streamelements-core/bin/64bit/`
-- datos del plugin a `~/.config/obs-studio/plugins/obs-streamelements-core/data/obs-plugins/obs-streamelements-core/`
+- Binario `.so` a `~/.config/obs-studio/plugins/obs-streamelements-core/bin/64bit/`
+- Datos del plugin a `~/.config/obs-studio/plugins/obs-streamelements-core/data/obs-plugins/obs-streamelements-core/`
 
 ### Ayuda
 
@@ -122,7 +302,7 @@ Esto copia:
 - `--install-user`: instala plugin compilado en perfil de usuario OBS.
 - `--user-plugin-dir <path>`: ruta base de instalación de plugin.
 
-## Ejemplos Útiles
+## Ejemplos útiles
 
 Build CI en carpeta separada:
 
@@ -161,5 +341,5 @@ El script se diseñó para ser reutilizable desde CI. Flujo recomendado:
 
 - Estado actual: **usable** en Linux.
 - Pendiente para estado “estable”:
-  - reducir warnings residuales.
-  - seguir auditando leaks intermitentes reportados al cierre de OBS.
+  - Reducir warnings residuales.
+  - Seguir auditando leaks intermitentes reportados al cierre de OBS.
