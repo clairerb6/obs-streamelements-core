@@ -4,7 +4,11 @@
 #include "StreamElementsGlobalStateManager.hpp"
 #include "StreamElementsVideoCompositionViewWidget.hpp"
 
+#if __has_include(<obs-browser/panel/browser-panel.hpp>)
+#include <obs-browser/panel/browser-panel.hpp>
+#elif __has_include("../../obs-browser/panel/browser-panel.hpp")
 #include "../../obs-browser/panel/browser-panel.hpp"
+#endif
 #include "../deps/base64/base64.hpp"
 
 #ifndef _WIN32

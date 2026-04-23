@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+
 if(CMAKE_PROJECT_NAME STREQUAL "obs-studio")
   #find_qt is replaced with find_package
   #install_obs_plugin_with_data is replaced with set_target_properties_obs
@@ -18,8 +20,18 @@ if(NOT QT_VERSION)
 endif()
 
 if(BUILD_OUT_OF_TREE)
-	#find_qt(VERSION ${QT_VERSION} COMPONENTS Core Widgets)
-	find_qt(VERSION ${QT_VERSION} COMPONENTS Widgets)
+	if(COMMAND find_qt)
+		#find_qt(VERSION ${QT_VERSION} COMPONENTS Core Widgets)
+		find_qt(VERSION ${QT_VERSION} COMPONENTS Widgets)
+	elseif(${QT_VERSION} EQUAL "6")
+		find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
+	else()
+		find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
+		if(NOT TARGET Qt::Widgets)
+			add_library(Qt::Widgets INTERFACE IMPORTED)
+			target_link_libraries(Qt::Widgets INTERFACE Qt5::Widgets)
+		endif()
+	endif()
 else()
   find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
 endif()
@@ -60,8 +72,60 @@ include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/UI/obs-frontend-api")
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}/deps")
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}/streamelements/deps")
+if(EXISTS "${CMAKE_SOURCE_DIR}/plugins")
+	include_directories("${CMAKE_SOURCE_DIR}/plugins")
+endif()
+# When this plugin is symlinked from outside the OBS tree, relative includes like
+# "../../obs-browser/panel/browser-panel.hpp" are resolved against the real source
+# location. Add the in-tree symlink path so those includes can still resolve.
+if(EXISTS "${CMAKE_SOURCE_DIR}/plugins/obs-streamelements-core/streamelements")
+	include_directories("${CMAKE_SOURCE_DIR}/plugins/obs-streamelements-core/streamelements")
+endif()
 
 find_package(CURL REQUIRED)
+find_package(PkgConfig QUIET)
+
+set(STREAMELEMENTS_OBS_LIBS
+	libobs
+	obs-frontend-api
+)
+
+if(BUILD_OUT_OF_TREE AND NOT TARGET libobs)
+	if(PkgConfig_FOUND)
+		pkg_check_modules(LIBOBS REQUIRED libobs)
+		pkg_check_modules(OBS_FRONTEND REQUIRED obs-frontend-api)
+
+		if(LIBOBS_INCLUDE_DIRS)
+			include_directories(SYSTEM ${LIBOBS_INCLUDE_DIRS})
+		endif()
+		if(OBS_FRONTEND_INCLUDE_DIRS)
+			include_directories(SYSTEM ${OBS_FRONTEND_INCLUDE_DIRS})
+		endif()
+
+		# Fedora headers live in /usr/include/obs and are required for includes like <obs.h>.
+		if(EXISTS "/usr/include/obs")
+			include_directories(SYSTEM "/usr/include/obs")
+		endif()
+
+		if(LIBOBS_LIBRARY_DIRS)
+			link_directories(${LIBOBS_LIBRARY_DIRS})
+		endif()
+		if(OBS_FRONTEND_LIBRARY_DIRS)
+			link_directories(${OBS_FRONTEND_LIBRARY_DIRS})
+		endif()
+
+		set(STREAMELEMENTS_OBS_LIBS
+			${OBS_FRONTEND_LIBRARIES}
+			${LIBOBS_LIBRARIES}
+		)
+	else()
+		# Fallback for environments without pkg-config.
+		set(STREAMELEMENTS_OBS_LIBS
+			obs
+			obs-frontend-api
+		)
+	endif()
+endif()
 
 if (ENABLE_ANGELSCRIPT)
 	include_directories(SYSTEM
@@ -124,8 +188,7 @@ if (ENABLE_BUGSPLAT)
 			optimized ${BUGSPLAT_LIBRARY})
 
 	set(obs-streamelements-core_LIBRARIES
-		libobs
-		obs-frontend-api
+		${STREAMELEMENTS_OBS_LIBS}
 		#Qt::Core
 		Qt::Widgets
 		w32-pthreads
@@ -133,8 +196,7 @@ if (ENABLE_BUGSPLAT)
 	)
 else()
 	set(obs-streamelements-core_LIBRARIES
-		libobs
-		obs-frontend-api
+		${STREAMELEMENTS_OBS_LIBS}
 		#Qt::Core
 		Qt::Widgets
 		#w32-pthreads
@@ -265,9 +327,13 @@ if (APPLE)
 		streamelements/mach_excServer.c
 		streamelements/mach_excUser.c
     )
-else()
+elseif(WIN32)
     list(APPEND obs-streamelements-core_SOURCES
         streamelements/StreamElementsCrashHandler.cpp
+    )
+else()
+    list(APPEND obs-streamelements-core_SOURCES
+        streamelements/StreamElementsCrashHandler_linux.cpp
     )
 endif(APPLE)
 
@@ -329,6 +395,7 @@ set(obs-streamelements-core_HEADERS
 	streamelements/StreamElementsRemoteIconLoader.hpp
 	streamelements/StreamElementsScenesListWidgetManager.hpp
 	streamelements/StreamElementsPleaseWaitWindow.hpp
+	streamelements/StreamElementsPleaseWaitWindow.ui
 	streamelements/StreamElementsHttpServerManager.hpp
 	streamelements/StreamElementsWebsocketApiServer.hpp
 	streamelements/StreamElementsLocalFilesystemHttpServer.hpp
@@ -643,14 +710,25 @@ endif()
 
 
 if(BUILD_OUT_OF_TREE)
-	install_obs_plugin_with_data(obs-streamelements-core data)
+	if(COMMAND install_obs_plugin_with_data)
+		install_obs_plugin_with_data(obs-streamelements-core data)
+	else()
+		install(TARGETS obs-streamelements-core LIBRARY DESTINATION lib/obs-plugins)
+		if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data")
+			install(DIRECTORY data/ DESTINATION share/obs/obs-plugins/obs-streamelements-core)
+		endif()
+	endif()
 else()
 	set_target_properties_obs(obs-streamelements-core PROPERTIES FOLDER "plugins/streamelements" PREFIX "")
 endif()
 
 if (ENABLE_ANGELSCRIPT)
 	if(BUILD_OUT_OF_TREE)
-		install_obs_plugin(obs-streamelements-core-streamelements-restore-script-host)
+		if(COMMAND install_obs_plugin)
+			install_obs_plugin(obs-streamelements-core-streamelements-restore-script-host)
+		else()
+			install(TARGETS obs-streamelements-core-streamelements-restore-script-host RUNTIME DESTINATION lib/obs-plugins)
+		endif()
 	else()
 		set_target_properties_obs(obs-streamelements-core-streamelements-restore-script-host PROPERTIES FOLDER "plugins/streamelements" PREFIX "")
 	endif()

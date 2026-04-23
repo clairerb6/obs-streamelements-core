@@ -10,6 +10,9 @@
 #include <QMouseEvent>
 #include <QColor>
 #include <QGuiApplication>
+#if !defined(_WIN32) && !defined(__APPLE__)
+#include <obs-nix-platform.h>
+#endif
 
 #include "canvas-config.hpp"
 #include "canvas-math.hpp"
@@ -381,14 +384,11 @@ static bool QTToGSWindow(QWindow *window, gs_window &gswindow)
 		gswindow.display = obs_get_nix_platform_display();
 		break;
 #ifdef ENABLE_WAYLAND
-	case OBS_NIX_PLATFORM_WAYLAND: {
-		QPlatformNativeInterface *native =
-			QGuiApplication::platformNativeInterface();
-		gswindow.display =
-			native->nativeResourceForWindow("surface", window);
-		success = gswindow.display != nullptr;
-		break;
-	}
+		case OBS_NIX_PLATFORM_WAYLAND: {
+			/* Wayland native surface bridge is not available in this build path. */
+			success = false;
+			break;
+		}
 #endif
 	default:
 		success = false;
@@ -450,12 +450,6 @@ StreamElementsVideoCompositionViewWidget::StreamElementsVideoCompositionViewWidg
 
 	connect(windowHandle(), &QWindow::visibleChanged, windowVisible);
 	connect(windowHandle(), &QWindow::screenChanged, screenChanged);
-
-#ifdef ENABLE_WAYLAND
-	if (obs_get_nix_platform() == OBS_NIX_PLATFORM_WAYLAND)
-		windowHandle()->installEventFilter(
-			new SurfaceEventFilter(this));
-#endif
 
 	CreateDisplay();
 

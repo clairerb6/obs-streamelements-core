@@ -10,6 +10,10 @@
         "name": "windows-x64-streamelements",
         "inherits": ["windows-x64"],
         "architecture": "x64"
+    },
+    {
+        "name": "linux-x64-streamelements",
+        "inherits": ["linux-x86_64"]
     }
   ]
 }

@@ -1,0 +1,21 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="images/logo.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/logo.png</file>
+    <file alias="images/updater_logo.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/updater_logo.png</file>
+    <file alias="images/updater_logo_dark.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/updater_logo_dark.png</file>
+    <file alias="images/icon.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/icon.png</file>
+    <file alias="images/icon.ico">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/icon.ico</file>
+    <file alias="images/logo_137x30.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/logo_137x30.png</file>
+    <file alias="images/logo_100x30.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/logo_100x30.png</file>
+    <file alias="images/toolbar/back.ico">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/toolbar/back.ico</file>
+    <file alias="images/toolbar/forward.ico">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/toolbar/forward.ico</file>
+    <file alias="images/toolbar/home.ico">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/toolbar/home.ico</file>
+    <file alias="images/toolbar/reload.ico">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/toolbar/reload.ico</file>
+    <file alias="images/toolbar/reload.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/toolbar/reload.png</file>
+    <file alias="images/toolbar/close.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/toolbar/close.png</file>
+    <file alias="images/toolbar/dockToggle.png">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/images/toolbar/dockToggle.png</file>
+    <file alias="html/error.html">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/html/error.html</file>
+    <file alias="html/loading.html">/home/clairerb6/Projects/Others/obs-streamelements-core/streamelements/html/loading.html</file>
+  </qresource>
+</RCC>
+

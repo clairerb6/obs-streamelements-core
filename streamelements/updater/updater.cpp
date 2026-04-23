@@ -34,6 +34,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #define GLOBAL_ENV_CONFIG_FILE_NAME "obs-studio/streamelements-env.ini"
 
@@ -375,6 +380,11 @@ static void download_update_package_async(std::string package_url,
 				command = tokens[0].toStdString();
 				tokens.erase(tokens.begin());
 
+#ifdef __linux__
+				// Installer packages on Linux may not preserve executable bit.
+				chmod(command.c_str(), 0755);
+#endif
+
                 // Start update package process
 				QProcess proc;
 				if (proc.startDetached(
@@ -651,39 +661,38 @@ static void check_for_updates_async(bool allowUseLastResponse, bool silent,
 								"";
 
 						// Update available, read package info
-#ifdef _WIN64
-							if (config_has_user_value(
-								    manifest,
-								    "obs-browser",
-								    "package_url_64")) {
-								package_url = config_get_string(
-									manifest,
-									"obs-browser",
-									"package_url_64");
+							if (sizeof(void*) == 8) {
+								if (config_has_user_value(
+									    manifest,
+									    "obs-browser",
+									    "package_url_64")) {
+									package_url = config_get_string(
+										manifest,
+										"obs-browser",
+										"package_url_64");
+								}
+							} else {
+								if (config_has_user_value(
+									    manifest,
+									    "obs-browser",
+									    "package_url_32")) {
+									package_url = config_get_string(
+										manifest,
+										"obs-browser",
+										"package_url_32");
+								}
 							}
-#else
-							if (config_has_user_value(
-								    manifest,
-								    "obs-browser",
-								    "package_url_32")) {
-								package_url = config_get_string(
-									manifest,
-									"obs-browser",
-									"package_url_32");
-							}
-#endif
-							else {
-                                if (config_has_user_value(
-                                        manifest,
-                                        "obs-browser",
-                                        "package_url")) {
-                                    package_url = config_get_string(
-                                        manifest,
-                                        "obs-browser",
-                                        "package_url");
-                                } else {
-                                    package_url = "";
-                                }
+
+							if (!package_url.size()) {
+								if (config_has_user_value(
+									    manifest,
+									    "obs-browser",
+									    "package_url")) {
+									package_url = config_get_string(
+										manifest,
+										"obs-browser",
+										"package_url");
+								}
 							}
 
 							package_url = replace_substr(
@@ -691,6 +700,8 @@ static void check_for_updates_async(bool allowUseLastResponse, bool silent,
 								"${ARCH_OS}",
 #ifdef __APPLE__
                                 "macos"
+#elif defined(__linux__)
+                                "linux"
 #else
                                 "windows"
 #endif
@@ -724,22 +735,22 @@ static void check_for_updates_async(bool allowUseLastResponse, bool silent,
 
 							bfree(abs_module_dl_path);
 
-							// Replace '/' with '\\'
-							module_dl_path =
-								replace_substr(
-									module_dl_path,
-									"/",
-									"\\");
-
-							// Remove last 3 path components
-							for (int i = 0; i < 3;
-							     ++i) {
+							// Remove last 3 path components in a platform-aware way.
+#ifdef _WIN32
+							module_dl_path = replace_substr(
+								module_dl_path, "/", "\\");
+							const char pathSep = '\\';
+#else
+							const char pathSep = '/';
+#endif
+							for (int i = 0; i < 3; ++i) {
+								size_t pos =
+									module_dl_path.find_last_of(
+										pathSep);
+								if (pos == std::string::npos)
+									break;
 								module_dl_path =
-									module_dl_path
-										.substr(0,
-											module_dl_path
-												.find_last_of(
-													'\\'));
+									module_dl_path.substr(0, pos);
 							}
 
 							// Replace '${OBS_INSTALL_DIR}' with module_dl_path

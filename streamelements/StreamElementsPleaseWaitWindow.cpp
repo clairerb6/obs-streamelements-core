@@ -1,5 +1,5 @@
 #include "StreamElementsPleaseWaitWindow.hpp"
-#include "ui_streamelementspleasewaitwindow.h"
+#include "ui_StreamElementsPleaseWaitWindow.h"
 
 #include "StreamElementsUtils.hpp"
 

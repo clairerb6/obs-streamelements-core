@@ -2,7 +2,11 @@
 
 #include "StreamElementsLocalFilesystemHttpServer.hpp"
 
+#if __has_include(<obs-browser/panel/browser-panel.hpp>)
+#include <obs-browser/panel/browser-panel.hpp>
+#elif __has_include("../../obs-browser/panel/browser-panel.hpp")
 #include "../../obs-browser/panel/browser-panel.hpp"
+#endif
 
 struct QCef;
 struct QCefCookieManager;

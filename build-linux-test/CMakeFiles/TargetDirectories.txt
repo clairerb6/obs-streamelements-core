@@ -1,0 +1,10 @@
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/obs-streamelements-core.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/obs-streamelements-core_other_files.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/edit_cache.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/rebuild_cache.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/list_install_components.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/install.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/install/local.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/install/strip.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/obs-streamelements-core_autogen_timestamp_deps.dir
+/home/clairerb6/Projects/Others/obs-streamelements-core/build-linux-test/CMakeFiles/obs-streamelements-core_autogen.dir

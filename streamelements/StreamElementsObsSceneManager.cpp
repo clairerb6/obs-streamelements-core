@@ -2704,10 +2704,10 @@ void StreamElementsObsSceneManager::SerializeObsSceneItems(
 	}
 
 	if (scene) {
-		struct local_context {
-			CefRefPtr<CefListValue> list;
-			decltype(videoComposition) videoComposition;
-			std::vector<obs_sceneitem_t*> sceneItems;
+			struct local_context {
+				CefRefPtr<CefListValue> list;
+				decltype(videoComposition) videoCompositionRef;
+				std::vector<obs_sceneitem_t*> sceneItems;
 
 			~local_context()
 			{
@@ -2718,10 +2718,10 @@ void StreamElementsObsSceneManager::SerializeObsSceneItems(
 			}
 		};
 
-		local_context context;
+			local_context context;
 
-		context.list = CefListValue::Create();
-		context.videoComposition = videoComposition;	
+			context.list = CefListValue::Create();
+			context.videoCompositionRef = videoComposition;	
 
 		// For each scene item
 		obs_scene_enum_items(
@@ -2745,11 +2745,11 @@ void StreamElementsObsSceneManager::SerializeObsSceneItems(
 
 			CefRefPtr<CefValue> item = CefValue::Create();
 
-			SerializeSourceAndSceneItem(
-				item, scene, source, it,
-				context.list->GetSize(), true,
-				serializeProperties,
-				context.videoComposition.get());
+				SerializeSourceAndSceneItem(
+					item, scene, source, it,
+					context.list->GetSize(), true,
+					serializeProperties,
+					context.videoCompositionRef.get());
 
 			context.list->SetValue(context.list->GetSize(), item);
 		}

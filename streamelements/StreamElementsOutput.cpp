@@ -121,7 +121,7 @@ static std::vector<uint32_t> DeserializeTracks(CefRefPtr<CefDictionaryValue> roo
 
 			auto trackIndex = uint32_t(list->GetInt(i));
 
-			if (trackIndex >= 0 && trackIndex < maxTrackIndex) {
+				if (trackIndex < maxTrackIndex) {
 				bool hasValue = false;
 
 				for (auto it = result.cbegin();
@@ -184,8 +184,7 @@ DeserializeVideoEncoders(CefRefPtr<CefDictionaryValue> rootDict)
 			} else if (list->GetType(i) == VTYPE_INT) {
 				auto trackIndex = uint32_t(list->GetInt(i));
 
-				if (trackIndex >= 0 &&
-				    trackIndex < maxTrackIndex) {
+					if (trackIndex < maxTrackIndex) {
 					bool hasValue = false;
 
 					for (auto it = result.cbegin();

@@ -1,6 +1,9 @@
 #include "StreamElementsPerformanceHistoryTracker.hpp"
 
-#ifndef WIN32
+#include <fstream>
+#include <string>
+
+#if defined(__APPLE__)
 #include <mach/mach_types.h>
 #include <mach/mach_init.h>
 #include <mach/mach_host.h>
@@ -8,6 +11,8 @@
 #include <mach/mach_time.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
+#elif defined(__linux__)
 #include <unistd.h>
 #endif
 
@@ -95,7 +100,7 @@ StreamElementsPerformanceHistoryTracker::StreamElementsPerformanceHistoryTracker
                         m_cpu_usage.erase(m_cpu_usage.begin());
                     }
                 }
-#else
+#elif defined(__APPLE__)
                 mach_port_t mach_port = mach_host_self();
                 host_cpu_load_info_data_t cpu_load_info;
 
@@ -114,6 +119,58 @@ StreamElementsPerformanceHistoryTracker::StreamElementsPerformanceHistoryTracker
                         m_cpu_usage.erase(m_cpu_usage.begin());
                     }
                 }
+#elif defined(__linux__)
+				std::ifstream procStat("/proc/stat");
+				std::string cpuLabel;
+				unsigned long long user = 0;
+				unsigned long long nice = 0;
+				unsigned long long system = 0;
+				unsigned long long idle = 0;
+				unsigned long long iowait = 0;
+				unsigned long long irq = 0;
+				unsigned long long softirq = 0;
+				unsigned long long steal = 0;
+
+				if (procStat >> cpuLabel >> user >> nice >> system >>
+					    idle >> iowait >> irq >> softirq >>
+					    steal) {
+					if (cpuLabel == "cpu") {
+						const long ticksPerSecond =
+							sysconf(_SC_CLK_TCK);
+						if (ticksPerSecond > 0) {
+							const seconds_t totalSeconds =
+								seconds_t(user + nice +
+									  system + idle + iowait +
+									  irq + softirq + steal) /
+								seconds_t(ticksPerSecond);
+							const seconds_t idleSeconds =
+								seconds_t(idle +
+									  iowait) /
+								seconds_t(
+									ticksPerSecond);
+
+							cpu_usage_t item;
+							item.idleSeconds = idleSeconds;
+							item.totalSeconds =
+								totalSeconds;
+							item.busySeconds =
+								totalSeconds -
+								idleSeconds;
+
+							std::lock_guard<
+								std::recursive_mutex>
+								guard(m_mutex);
+							m_cpu_usage.push_back(item);
+
+							while (m_cpu_usage.size() >
+							       BUF_SIZE) {
+								m_cpu_usage.erase(
+									m_cpu_usage
+										.begin());
+							}
+						}
+					}
+				}
 #endif
             }
 
@@ -133,7 +190,7 @@ StreamElementsPerformanceHistoryTracker::StreamElementsPerformanceHistoryTracker
                         m_memory_usage.erase(m_memory_usage.begin());
                     }
                 }
-#else
+#elif defined(__APPLE__)
                 memory_usage_t mem;
 
                 mach_port_t mach_port = mach_host_self();
@@ -157,6 +214,43 @@ StreamElementsPerformanceHistoryTracker::StreamElementsPerformanceHistoryTracker
                         m_memory_usage.erase(m_memory_usage.begin());
                     }
                 }
+#elif defined(__linux__)
+				memory_usage_t mem;
+
+				std::ifstream memInfo("/proc/meminfo");
+				std::string key;
+				unsigned long long valueKb = 0;
+				std::string unit;
+				unsigned long long memTotalKb = 0;
+				unsigned long long memAvailableKb = 0;
+
+				while (memInfo >> key >> valueKb >> unit) {
+					if (key == "MemTotal:")
+						memTotalKb = valueKb;
+					else if (key == "MemAvailable:")
+						memAvailableKb = valueKb;
+				}
+
+				if (memTotalKb > 0) {
+					const unsigned long long memUsedKb =
+						memAvailableKb <= memTotalKb
+							? (memTotalKb -
+							   memAvailableKb)
+							: 0;
+						mem.dwMemoryLoad = static_cast<unsigned int>(
+							(memUsedKb * 100ULL) /
+							memTotalKb);
+
+					std::lock_guard<std::recursive_mutex> guard(
+						m_mutex);
+
+					m_memory_usage.push_back(mem);
+
+					while (m_memory_usage.size() > BUF_SIZE) {
+						m_memory_usage.erase(
+							m_memory_usage.begin());
+					}
+				}
 #endif
             }
 		} while (0 != os_event_timedwait(m_quit_event, 60000));

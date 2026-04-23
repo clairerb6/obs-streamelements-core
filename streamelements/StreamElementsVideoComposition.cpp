@@ -1155,7 +1155,7 @@ public:
 protected:
 	virtual obs_encoder_t *GetStreamingVideoEncoder(size_t index)
 	{
-		if (index >= 0 && index < m_streamingVideoEncoders.size())
+		if (index < m_streamingVideoEncoders.size())
 			return m_streamingVideoEncoders[index];
 		else
 			return nullptr;
@@ -1163,7 +1163,7 @@ protected:
 
 	virtual obs_encoder_t *GetRecordingVideoEncoder(size_t index)
 	{
-		if (index >= 0 && index < m_recordingVideoEncoders.size())
+		if (index < m_recordingVideoEncoders.size())
 			return m_recordingVideoEncoders[index];
 		else
 			return GetStreamingVideoEncoder(index);

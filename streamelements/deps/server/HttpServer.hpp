@@ -22,7 +22,7 @@ public:
 		  std::string bindToIpAddress = "127.0.0.1");
 	void Stop();
 
-	const int GetPortNumber() const { return m_portNumber; }
+	int GetPortNumber() const { return m_portNumber; }
 	const std::string GetIpAddress() const { return m_ipAddress; }
 
 private:

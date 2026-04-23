@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <regex>
+#include <fstream>
 
 #include <curl/curl.h>
 
@@ -38,7 +39,7 @@
 
 #include "deps/picosha2/picosha2.h"
 
-#ifndef WIN32
+#if defined(__APPLE__)
 #include <mach/mach_types.h>
 #include <mach/mach_init.h>
 #include <mach/mach_host.h>
@@ -47,6 +48,12 @@
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#elif defined(__linux__)
+#include <sys/types.h>
+#include <sys/syscall.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+#include <cstdlib>
 #endif
 
 #ifndef WIN32
@@ -64,7 +71,6 @@
 	typedef void *HKEY;
 	#endif
 
-#include <sys/syscall.h>
 #endif
 
 /* ========================================================= */
@@ -199,8 +205,12 @@ std::shared_ptr<StreamElementsApiContextItem> PushApiContext(CefString method, C
 		std::make_shared<StreamElementsApiContextItem>(method, args,
 #ifdef _WIN32
 							       GetCurrentThreadId()
-#else
+#elif defined(__APPLE__)
 							       uint32_t(syscall(SYS_thread_selfid))
+#elif defined(SYS_gettid)
+							       uint32_t(syscall(SYS_gettid))
+#else
+							       0
 #endif
 							       );
 
@@ -437,7 +447,7 @@ void SerializeSystemTimes(CefRefPtr<CefValue> &output)
 		d->SetDouble("totalSeconds", kernelRat + userRat);
 		d->SetDouble("busySeconds", kernelRat + userRat - idleRat);
 	}
-#else
+#elif defined(__APPLE__)
     mach_port_t mach_port = mach_host_self();
     host_cpu_load_info_data_t cpu_load_info;
 
@@ -452,6 +462,47 @@ void SerializeSystemTimes(CefRefPtr<CefValue> &output)
         d->SetDouble("totalSeconds", (double)(cpu_load_info.cpu_ticks[CPU_STATE_SYSTEM] + cpu_load_info.cpu_ticks[CPU_STATE_USER] + cpu_load_info.cpu_ticks[CPU_STATE_IDLE] + cpu_load_info.cpu_ticks[CPU_STATE_NICE]) / (double)CLOCKS_PER_SEC);
         d->SetDouble("busySeconds", (double)(cpu_load_info.cpu_ticks[CPU_STATE_SYSTEM] + cpu_load_info.cpu_ticks[CPU_STATE_USER] + cpu_load_info.cpu_ticks[CPU_STATE_NICE]) / (double)CLOCKS_PER_SEC);
     }
+#elif defined(__linux__)
+	std::ifstream procStat("/proc/stat");
+	std::string cpuLabel;
+	unsigned long long user = 0;
+	unsigned long long nice = 0;
+	unsigned long long system = 0;
+	unsigned long long idle = 0;
+	unsigned long long iowait = 0;
+	unsigned long long irq = 0;
+	unsigned long long softirq = 0;
+	unsigned long long steal = 0;
+	if (procStat >> cpuLabel >> user >> nice >> system >> idle >> iowait >>
+	    irq >> softirq >> steal) {
+		if (cpuLabel == "cpu") {
+			const long ticksPerSecond = sysconf(_SC_CLK_TCK);
+			if (ticksPerSecond > 0) {
+				const double totalTicks =
+					double(user + nice + system + idle + iowait +
+					       irq + softirq + steal);
+				const double idleTicks = double(idle + iowait);
+				const double busyTicks = totalTicks - idleTicks;
+
+				CefRefPtr<CefDictionaryValue> d =
+					CefDictionaryValue::Create();
+				output->SetDictionary(d);
+
+				d->SetDouble("idleSeconds",
+					     idleTicks / double(ticksPerSecond));
+				d->SetDouble("kernelSeconds",
+					     double(system + irq + softirq) /
+						     double(ticksPerSecond));
+				d->SetDouble("userSeconds",
+					     double(user + nice) /
+						     double(ticksPerSecond));
+				d->SetDouble("totalSeconds",
+					     totalTicks / double(ticksPerSecond));
+				d->SetDouble("busySeconds",
+					     busyTicks / double(ticksPerSecond));
+			}
+		}
+	}
 #endif
 }
 
@@ -481,7 +532,7 @@ void SerializeSystemMemoryUsage(CefRefPtr<CefValue> &output)
 		d->SetInt("totalPageFileSize", mem.ullTotalPageFile / DIV);
 		d->SetInt("freePageFileSize", mem.ullAvailPageFile / DIV);
 	}
-#else
+#elif defined(__APPLE__)
     mach_port_t mach_port = mach_host_self();
     vm_statistics_data_t vm_stats;
 
@@ -514,6 +565,48 @@ void SerializeSystemMemoryUsage(CefRefPtr<CefValue> &output)
             d->SetInt("freePhysicalMemory", free_memory / DIV); // inaccurate
         }
     }
+#elif defined(__linux__)
+	std::ifstream memInfo("/proc/meminfo");
+	std::string key;
+	uint64_t valueKb = 0;
+	std::string unit;
+	uint64_t memTotalKb = 0;
+	uint64_t memAvailableKb = 0;
+	uint64_t swapTotalKb = 0;
+	uint64_t swapFreeKb = 0;
+
+	while (memInfo >> key >> valueKb >> unit) {
+		if (key == "MemTotal:")
+			memTotalKb = valueKb;
+		else if (key == "MemAvailable:")
+			memAvailableKb = valueKb;
+		else if (key == "SwapTotal:")
+			swapTotalKb = valueKb;
+		else if (key == "SwapFree:")
+			swapFreeKb = valueKb;
+	}
+
+	if (memTotalKb > 0) {
+		const uint64_t memUsedKb =
+			memAvailableKb <= memTotalKb ? (memTotalKb - memAvailableKb)
+						     : 0;
+
+		CefRefPtr<CefDictionaryValue> d = CefDictionaryValue::Create();
+		output->SetDictionary(d);
+
+		d->SetString("units", "MB");
+		d->SetInt("memoryUsedPercentage",
+			  int((memUsedKb * 100ULL) / memTotalKb));
+		d->SetInt("totalPhysicalMemory", int(memTotalKb / 1024ULL));
+		d->SetInt("freePhysicalMemory", int(memAvailableKb / 1024ULL));
+		d->SetInt("totalVirtualMemory",
+			  int((memTotalKb + swapTotalKb) / 1024ULL));
+		d->SetInt("freeVirtualMemory",
+			  int((memAvailableKb + swapFreeKb) / 1024ULL));
+		d->SetInt("freeExtendedVirtualMemory", 0);
+		d->SetInt("totalPageFileSize", int(swapTotalKb / 1024ULL));
+		d->SetInt("freePageFileSize", int(swapFreeKb / 1024ULL));
+	}
 #endif
 }
 
@@ -707,6 +800,79 @@ void SerializeSystemHardwareProperties(CefRefPtr<CefValue> &output)
 	}
     
     d->SetString("os", "Windows");
+}
+#endif
+
+#ifdef __linux__
+void SerializeSystemHardwareProperties(CefRefPtr<CefValue> &output)
+{
+	output->SetNull();
+
+	CefRefPtr<CefDictionaryValue> d = CefDictionaryValue::Create();
+	output->SetDictionary(d);
+
+	d->SetString("platform", "linux");
+	d->SetString("cpuArch", sizeof(void *) == 8 ? "x64" : "x86");
+	d->SetInt("cpuCount", os_get_physical_cores());
+	d->SetInt("cpuLevel", 0);
+	d->SetInt("logicalCpuCount", os_get_logical_cores());
+
+	{
+		CefRefPtr<CefListValue> cpuList = CefListValue::Create();
+		CefRefPtr<CefDictionaryValue> p = CefDictionaryValue::Create();
+
+		std::ifstream cpuInfo("/proc/cpuinfo");
+		std::string line;
+		while (std::getline(cpuInfo, line)) {
+			const auto sep = line.find(':');
+			if (sep == std::string::npos)
+				continue;
+
+			std::string k = line.substr(0, sep);
+			std::string v = line.substr(sep + 1);
+			while (!v.empty() && (v[0] == ' ' || v[0] == '\t'))
+				v.erase(v.begin());
+
+			if (k.find("model name") != std::string::npos)
+				p->SetString("name", v);
+			else if (k.find("vendor_id") != std::string::npos)
+				p->SetString("vendor", v);
+			else if (k.find("cpu MHz") != std::string::npos) {
+				int speedMhz = 0;
+				try {
+					speedMhz = int(std::stod(v));
+				} catch (...) {
+					speedMhz = 0;
+				}
+				p->SetInt("speedMHz", speedMhz);
+			}
+
+			if (p->HasKey("name") && p->HasKey("vendor") &&
+			    p->HasKey("speedMHz"))
+				break;
+		}
+
+		p->SetString("identifier", "");
+		cpuList->SetDictionary(cpuList->GetSize(), p);
+		d->SetList("cpuHardware", cpuList);
+	}
+
+	d->SetDictionary("bios", CefDictionaryValue::Create());
+
+	{
+		struct utsname uts = {};
+		if (uname(&uts) == 0) {
+			d->SetString("os", "Linux");
+			d->SetString("osName", uts.sysname);
+			d->SetString("osVersion", uts.release);
+			d->SetString("osKernelVersion", uts.version);
+		} else {
+			d->SetString("os", "Linux");
+			d->SetString("osName", "Linux");
+			d->SetString("osVersion", "Unknown");
+			d->SetString("osKernelVersion", "Unknown");
+		}
+	}
 }
 #endif
 
@@ -1434,6 +1600,22 @@ void SetGlobalCURLOptions(CURL *curl, const char *url)
 }
 #endif
 
+#if !defined(WIN32) && !defined(__APPLE__)
+void SetGlobalCURLOptions(CURL *curl, const char *url)
+{
+	UNUSED_PARAMETER(url);
+
+	// Linux fallback: honor explicit proxy option if provided.
+	std::string proxy =
+		GetCommandLineOptionValue("streamelements-http-proxy");
+
+	if (!proxy.empty()) {
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+		curl_easy_setopt(curl, CURLOPT_PROXY, proxy.c_str());
+	}
+}
+#endif
+
 struct http_callback_context {
 	http_client_callback_t callback;
 	void *userdata;
@@ -2025,6 +2207,21 @@ std::string CreateCryptoSecureRandomNumberString()
 }
 #endif
 
+#ifdef __linux__
+std::string CreateCryptoSecureRandomNumberString()
+{
+	uint64_t buffer = 0;
+	std::ifstream urandom("/dev/urandom", std::ios::binary);
+	if (urandom.good()) {
+		urandom.read(reinterpret_cast<char *>(&buffer), sizeof(buffer));
+	}
+
+	char buf[sizeof(buffer) * 2 + 1];
+	snprintf(buf, sizeof(buf), "%llX", (unsigned long long)buffer);
+	return buf;
+}
+#endif
+
 #ifdef WIN32
 #include <wbemidl.h>
 #pragma comment(lib, "wbemuuid.lib")
@@ -2184,6 +2381,55 @@ std::string GetComputerSystemUniqueId()
 
 	if (result.size() && result != prevResult) {
 		// Save for future use
+		WriteEnvironmentConfigString(REG_VALUE_NAME, result.c_str(),
+					     nullptr);
+	}
+
+	return result;
+}
+#endif
+
+#ifdef __linux__
+std::string GetComputerSystemUniqueId()
+{
+	const char *REG_VALUE_NAME = "MachineUniqueIdentifier";
+
+	std::string result =
+		ReadEnvironmentConfigString(REG_VALUE_NAME, nullptr);
+	const std::string prevResult = result;
+
+	if (result.empty()) {
+		std::string machineId;
+		const char *candidates[] = {"/etc/machine-id",
+					    "/var/lib/dbus/machine-id"};
+		for (const char *path : candidates) {
+			std::ifstream in(path);
+			if (!in.good())
+				continue;
+			std::getline(in, machineId);
+			if (!machineId.empty())
+				break;
+		}
+
+		if (!machineId.empty()) {
+			const char *username = getenv("USER");
+			std::string user = username ? username : "unknown";
+			std::string userHash = CreateSHA256Digest(user);
+			if (userHash.size() > 16)
+				userHash = userHash.substr(0, 16);
+
+			result = "LUID/" + clean_guid_string(machineId) + "-" +
+				 userHash;
+		}
+	}
+
+	if (result.empty()) {
+		result = std::string("SEID/") +
+			 clean_guid_string(CreateGloballyUniqueIdString()) + "-" +
+			 CreateCryptoSecureRandomNumberString();
+	}
+
+	if (result.size() && result != prevResult) {
 		WriteEnvironmentConfigString(REG_VALUE_NAME, result.c_str(),
 					     nullptr);
 	}
@@ -3465,6 +3711,23 @@ void RestartCurrentApplication()
 
 		//mainWindow->close();
 	}
+}
+#endif
+
+#ifdef __linux__
+void RestartCurrentApplication()
+{
+	bool success = QProcess::startDetached(
+		QCoreApplication::instance()->applicationFilePath(),
+		QCoreApplication::instance()->arguments());
+
+	if (success) {
+		// Exit without running regular shutdown handlers. The caller has already
+		// deferred frontend saves to avoid overriding restored backup files.
+		::_exit(0);
+	}
+
+	QApplication::quit();
 }
 #endif
 

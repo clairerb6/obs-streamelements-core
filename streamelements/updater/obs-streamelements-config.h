@@ -6,6 +6,9 @@
 #ifdef __APPLE__
 #define STREAMELEMENTS_DEFAULT_UPDATE_MANIFEST_URL "https://cdn.streamelements.com/obs/dist/obs-streamelements/macos/latest/obs-streamelements.manifest"
 #define STREAMELEMENTS_UPDATE_PACKAGE_FILENAME "obs-streamelements-update.pkg"
+#elif defined(__linux__)
+#define STREAMELEMENTS_DEFAULT_UPDATE_MANIFEST_URL "https://cdn.streamelements.com/obs/dist/obs-streamelements/linux/latest/obs-streamelements.manifest"
+#define STREAMELEMENTS_UPDATE_PACKAGE_FILENAME "obs-streamelements-update.bin"
 #else
 #define STREAMELEMENTS_DEFAULT_UPDATE_MANIFEST_URL "https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/latest/obs-streamelements.manifest"
 #define STREAMELEMENTS_UPDATE_PACKAGE_FILENAME "obs-streamelements-update.exe"
