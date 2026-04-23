@@ -3,6 +3,7 @@
 #include "StreamElementsGlobalStateManager.hpp"
 
 #include <QVBoxLayout>
+#include <QEventLoop>
 
 #include "cef-headers.hpp"
 
@@ -252,7 +253,28 @@ void StreamElementsBrowserDialog::hideEvent(QHideEvent* event)
 
 int StreamElementsBrowserDialog::exec()
 {
-	int result = QDialog::exec();
+	int result = QDialog::Rejected;
+
+#if defined(__linux__)
+	// Avoid direct nested QDialog::exec() on Linux/X11 where this dialog can
+	// intermittently crash in Qt paint path during SE modal flows.
+	QEventLoop loop;
+	const auto connection = QObject::connect(
+		this, &QDialog::finished, &loop,
+		[&result, &loop](int code) {
+			result = code;
+			loop.quit();
+		});
+
+	setModal(true);
+	show();
+	loop.exec();
+	setModal(false);
+
+	QObject::disconnect(connection);
+#else
+	result = QDialog::exec();
+#endif
 
 	DestroyBrowser("exec finished");
 

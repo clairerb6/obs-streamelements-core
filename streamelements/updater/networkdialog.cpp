@@ -209,9 +209,8 @@ void NetworkDialog::on_ctl_cancelButton_clicked()
 
 void NetworkDialog::HideDialog()
 {
-	QMetaObject::invokeMethod(this,
-				  "hide", Qt::QueuedConnection);
-
-	QMetaObject::invokeMethod(this, "setModal", Qt::QueuedConnection,
-				  Q_ARG(bool, false));
+	QMetaObject::invokeMethod(this, [this]() {
+		hide();
+		setModal(false);
+	}, Qt::QueuedConnection);
 }
