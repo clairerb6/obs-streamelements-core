@@ -42,11 +42,16 @@ public:
 #endif
 
 		m_dockWidget = new QDockWidget();
+		m_dockWidget->setObjectName(
+			QString("se_worker_dock_%1").arg(QString::fromStdString(id)));
+		m_dockWidget->setWindowTitle(
+			QString("SE Worker %1").arg(QString::fromStdString(id)));
 		m_dockWidget->setVisible(true);
-		m_dockWidget->layout()->addWidget(browserWidget);
+		m_dockWidget->setWidget(browserWidget);
 		m_dockWidget->setGeometry(QRect(rec.width() * 2, rec.height() * 2, 1920, 1080));
 
-		mainWindow->addDockWidget(Qt::NoDockWidgetArea, m_dockWidget);
+		mainWindow->addDockWidget(Qt::LeftDockWidgetArea, m_dockWidget);
+		m_dockWidget->setFloating(true);
 
 		QTimer::singleShot(std::chrono::milliseconds(0), qApp, [this]() {
 			m_dockWidget->hide();

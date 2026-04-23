@@ -115,6 +115,7 @@ static void SetMainWindowStyle()
 StreamElementsGlobalStateManager::ThemeChangeListener::ThemeChangeListener()
 	: QDockWidget()
 {
+	setObjectName("se_themeChangeListenerDock");
 	setVisible(false);
 	setFloating(true);
 
@@ -469,13 +470,8 @@ void StreamElementsGlobalStateManager::Initialize(QMainWindow *obs_main_window)
 
 	m_appStateListener = new ApplicationStateListener();
 	m_themeChangeListener = new ThemeChangeListener();
-#ifdef WIN32
-	mainWindow()->addDockWidget(Qt::NoDockWidgetArea,
-					m_themeChangeListener);
-#else
 	mainWindow()->addDockWidget(Qt::BottomDockWidgetArea,
 					m_themeChangeListener);
-#endif
 
 	{
 		// Set up "Live Support" button

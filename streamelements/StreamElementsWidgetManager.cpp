@@ -228,7 +228,11 @@ bool StreamElementsWidgetManager::AddDockWidget(
 	dock->setWindowTitle(title);
 
 	dock->setWidget(widget);
-	m_parent->addDockWidget(area, dock);
+	// Qt logs "invalid 'area' argument" for NoDockWidgetArea.
+	// Insert into a valid area first, then toggle to floating below.
+	const Qt::DockWidgetArea addArea =
+		(area == Qt::NoDockWidgetArea) ? Qt::LeftDockWidgetArea : area;
+	m_parent->addDockWidget(addArea, dock);
 
 	m_dockWidgets[id] = dock;
 	m_dockWidgetAreas[id] = area;
