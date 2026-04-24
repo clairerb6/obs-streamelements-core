@@ -480,12 +480,20 @@ protected:
 	virtual void mousePressEvent(QMouseEvent *event) override;
 	virtual void mouseReleaseEvent(QMouseEvent *event) override;
 
-	virtual void enterEvent(QEnterEvent *event) override {
+	#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+	virtual void enterEvent(QEnterEvent *event) override
+	{
 		m_currMouseWidgetX = event->localPos().x();
 		m_currMouseWidgetY = event->localPos().y();
-
 		m_currUnderMouse = true;
 	}
+	#else
+	virtual void enterEvent(QEvent *event) override
+	{
+		Q_UNUSED(event);
+		m_currUnderMouse = true;
+	}
+	#endif
 	virtual void leaveEvent(QEvent *event) override { m_currUnderMouse = false; }
 
 private:

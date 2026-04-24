@@ -96,6 +96,16 @@ chmod +x _scripts/build-linux.sh
 ./_scripts/build-linux.sh
 ```
 
+By default, the script auto-detects an external `obs-browser` checkout at:
+
+- `../obs-browser` (sibling directory of this repository)
+
+If needed, pass it explicitly:
+
+```bash
+./_scripts/build-linux.sh --obs-browser-dir ~/Projects/Others/obs-browser
+```
+
 ### Clean build
 
 ```bash
@@ -131,6 +141,22 @@ This copies:
 - `--cmake-arg <arg>`: extra CMake configure argument (repeatable).
 - `--install-user`: install compiled plugin in OBS user profile.
 - `--user-plugin-dir <path>`: base plugin install path.
+- `--obs-browser-dir <path>`: path to an external `obs-browser` checkout.
+
+## Wayland / X11 workaround used in this branch
+
+This branch applies a Linux rendering workaround focused on Wayland:
+
+- The video composition widget uses a **Wayland-only path** in the Linux window bridge.
+- **X11 fallback is intentionally disabled** in this branch.
+
+Operational implications:
+
+- Use this branch only in environments where Wayland is expected.
+- If OBS is running through X11/XWayland, that path is intentionally not used here.
+- The build still requires `obs-browser` headers (official repo recommended), provided via:
+  - sibling checkout `../obs-browser` (auto-detected), or
+  - `--obs-browser-dir <path>`.
 
 ## Useful examples
 
@@ -266,6 +292,16 @@ chmod +x _scripts/build-linux.sh
 ./_scripts/build-linux.sh
 ```
 
+Por defecto, el script autodetecta un checkout externo de `obs-browser` en:
+
+- `../obs-browser` (directorio hermano de este repositorio)
+
+Si hace falta, se puede pasar explícitamente:
+
+```bash
+./_scripts/build-linux.sh --obs-browser-dir ~/Projects/Others/obs-browser
+```
+
 ### Build limpia
 
 ```bash
@@ -301,6 +337,22 @@ Esto copia:
 - `--cmake-arg <arg>`: agrega argumentos extra a CMake (repetible).
 - `--install-user`: instala plugin compilado en perfil de usuario OBS.
 - `--user-plugin-dir <path>`: ruta base de instalación de plugin.
+- `--obs-browser-dir <path>`: ruta de un checkout externo de `obs-browser`.
+
+## Workaround Wayland / X11 usado en esta rama
+
+Esta rama aplica un workaround de render Linux enfocado en Wayland:
+
+- El widget de composición de video usa una ruta **solo Wayland** en el bridge de ventana Linux.
+- El fallback a **X11 está deshabilitado intencionalmente** en esta rama.
+
+Implicaciones operativas:
+
+- Esta rama debe usarse en entornos donde se espera Wayland.
+- Si OBS corre sobre X11/XWayland, ese camino no se utiliza en esta rama.
+- La build sigue necesitando headers de `obs-browser` (recomendado repo oficial), disponibles por:
+  - checkout hermano `../obs-browser` (autodetección), o
+  - `--obs-browser-dir <path>`.
 
 ## Ejemplos útiles
 

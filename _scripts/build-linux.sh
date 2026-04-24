@@ -15,6 +15,7 @@ CONFIGURE_ONLY=0
 NO_CONFIGURE=0
 INSTALL_USER=0
 USER_PLUGIN_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/obs-studio/plugins/obs-streamelements-core"
+OBS_BROWSER_DIR=""
 CMAKE_ARGS=()
 
 usage() {
@@ -35,6 +36,7 @@ Options:
   --cmake-arg <arg>           Extra CMake configure argument (repeatable)
   --install-user              Install built plugin into ~/.config/obs-studio/plugins
   --user-plugin-dir <path>    Install root for plugin (default: ${USER_PLUGIN_DIR})
+  --obs-browser-dir <path>    Path to obs-browser checkout (optional; auto-detected as sibling ../obs-browser)
   -h, --help                  Show this help
 
 Examples:
@@ -106,6 +108,11 @@ while [[ $# -gt 0 ]]; do
       USER_PLUGIN_DIR="$2"
       shift 2
       ;;
+    --obs-browser-dir)
+      [[ $# -ge 2 ]] || fail "Missing value for --obs-browser-dir"
+      OBS_BROWSER_DIR="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -121,6 +128,19 @@ if [[ "${CONFIGURE_ONLY}" -eq 1 && "${NO_CONFIGURE}" -eq 1 ]]; then
 fi
 
 command -v cmake >/dev/null 2>&1 || fail "cmake is required"
+
+if [[ -z "${OBS_BROWSER_DIR}" ]]; then
+  AUTO_OBS_BROWSER_DIR="$(cd "${REPO_ROOT}/.." && pwd)/obs-browser"
+  if [[ -d "${AUTO_OBS_BROWSER_DIR}" ]]; then
+    OBS_BROWSER_DIR="${AUTO_OBS_BROWSER_DIR}"
+  fi
+fi
+
+if [[ -n "${OBS_BROWSER_DIR}" ]]; then
+  [[ -d "${OBS_BROWSER_DIR}" ]] || fail "obs-browser directory not found: ${OBS_BROWSER_DIR}"
+  log "Using obs-browser from: ${OBS_BROWSER_DIR}"
+  CMAKE_ARGS+=("-DOBS_BROWSER_DIR=${OBS_BROWSER_DIR}")
+fi
 
 if [[ "${CLEAN}" -eq 1 ]]; then
   log "Cleaning build directory: ${BUILD_DIR}"

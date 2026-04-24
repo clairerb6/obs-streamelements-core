@@ -10,6 +10,7 @@
 #include <QMouseEvent>
 #include <QColor>
 #include <QGuiApplication>
+#include <limits>
 #if !defined(_WIN32) && !defined(__APPLE__)
 #include <obs-nix-platform.h>
 #endif
@@ -378,21 +379,18 @@ static bool QTToGSWindow(QWindow *window, gs_window &gswindow)
 #elif __APPLE__
 	gswindow.view = (id)window->winId();
 #else
-	switch (obs_get_nix_platform()) {
-	case OBS_NIX_PLATFORM_X11_EGL:
-		gswindow.id = window->winId();
-		gswindow.display = obs_get_nix_platform_display();
-		break;
-#ifdef ENABLE_WAYLAND
-		case OBS_NIX_PLATFORM_WAYLAND: {
-			/* Wayland native surface bridge is not available in this build path. */
-			success = false;
-			break;
-		}
-#endif
-	default:
+	// Wayland-only branch: this feature branch intentionally removes X11 path.
+	if (obs_get_nix_platform() != OBS_NIX_PLATFORM_WAYLAND) {
 		success = false;
-		break;
+	} else {
+		const auto winId = static_cast<uint64_t>(window->winId());
+		if (winId > std::numeric_limits<uint32_t>::max()) {
+			success = false;
+		} else {
+			gswindow.id = static_cast<uint32_t>(winId);
+			gswindow.display = obs_get_nix_platform_display();
+			success = (gswindow.display != nullptr);
+		}
 	}
 #endif
 	return success;
