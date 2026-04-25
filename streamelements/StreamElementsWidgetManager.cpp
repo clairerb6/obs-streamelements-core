@@ -6,6 +6,13 @@
 #include <mutex>
 
 #include <QApplication>
+#include <QGuiApplication>
+
+static bool IsWaylandQtPlatform()
+{
+	const QString platformName = QGuiApplication::platformName().toLower();
+	return platformName.contains("wayland");
+}
 
 StreamElementsWidgetManager::StreamElementsWidgetManager(QMainWindow *parent)
 	: m_parent(parent), m_nativeCentralWidget(nullptr)
@@ -180,7 +187,9 @@ bool StreamElementsWidgetManager::AddDockWidget(
 				  Qt::WindowFlags flags = Qt::WindowFlags())
 			: QDockWidget(title, parent, flags)
 		{
-			setAttribute(Qt::WA_NativeWindow);
+			if (!IsWaylandQtPlatform()) {
+				setAttribute(Qt::WA_NativeWindow);
+			}
 		}
 
 	protected:

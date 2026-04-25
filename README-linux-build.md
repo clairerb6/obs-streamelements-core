@@ -154,9 +154,42 @@ Operational implications:
 
 - Use this branch only in environments where Wayland is expected.
 - If OBS is running through X11/XWayland, that path is intentionally not used here.
-- The build still requires `obs-browser` headers (official repo recommended), provided via:
+- The build requires the `obs-browser` changes from this migration, available in the fork `clairerb6/obs-browser`.
+- Upstream/official `obs-browser` may not include the required Wayland behavior used by this branch.
+- `obs-browser` can be provided via:
   - sibling checkout `../obs-browser` (auto-detected), or
   - `--obs-browser-dir <path>`.
+
+## Runtime troubleshooting (Linux)
+
+If the module appears in logs but SE.Live UI does not initialize, check for:
+
+- `obs-streamelements-core: obs_browser_init_panel() failed`
+
+In this branch, we explicitly keep a Wayland-only runtime strategy.
+If that message appears, it indicates browser panel initialization failed even
+after the Wayland-first path.
+
+Policy for this branch:
+- Do **not** force `QT_QPA_PLATFORM=xcb`.
+- Do **not** rely on X11/XWayland as a runtime fallback.
+- Validate in a native Wayland OBS session.
+
+## Stability update (2026-04-25)
+
+This branch now includes a stability fix in `obs-streamelements-core` for repeated OBS launches.
+
+- Root cause observed in coredumps: crashes in `linux-pulseaudio.so` (`pa_stream_peek`) during source-type enumeration.
+- Mitigation applied: available source type serialization now avoids creating transient audio sources when properties are not requested.
+- Result: repeated launches are significantly more stable and no recurring startup crash was reproduced in the latest validation pass.
+
+Current known limitation (not a crash):
+- Wayland docked web panels can still intermittently render as black/empty/offset on first attach.
+- Current workaround: undock and dock the panel again; after re-docking, panels render correctly in current tests.
+
+Recommended runtime hygiene:
+- Keep a single active `obs-browser` plugin build in OBS.
+- Avoid loading both distro/system `obs-browser` and custom local `obs-browser` at the same time.
 
 ## Useful examples
 
@@ -197,6 +230,7 @@ This script was designed to be reusable from CI. Recommended flow:
 
 - Current status: **usable** on Linux.
 - Pending work before “stable” status:
+  - finish Wayland docked panel rendering consistency (black/empty intermittent state).
   - reduce remaining warnings.
   - continue auditing intermittent leaks reported during OBS shutdown.
 
@@ -350,9 +384,43 @@ Implicaciones operativas:
 
 - Esta rama debe usarse en entornos donde se espera Wayland.
 - Si OBS corre sobre X11/XWayland, ese camino no se utiliza en esta rama.
-- La build sigue necesitando headers de `obs-browser` (recomendado repo oficial), disponibles por:
+- La build necesita los cambios de `obs-browser` usados en esta migración, disponibles en el fork `clairerb6/obs-browser`.
+- El `obs-browser` oficial/upstream puede no incluir el comportamiento Wayland requerido por esta rama.
+- `obs-browser` se puede proveer por:
   - checkout hermano `../obs-browser` (autodetección), o
   - `--obs-browser-dir <path>`.
+
+## Troubleshooting de ejecución (Linux)
+
+Si el módulo aparece en logs pero la UI de SE.Live no termina de inicializar,
+busca esta línea:
+
+- `obs-streamelements-core: obs_browser_init_panel() failed`
+
+En esta rama mantenemos estrategia de ejecución **solo Wayland**.
+Si aparece ese mensaje, la inicialización del panel de navegador falló incluso
+después de intentar la ruta Wayland-first.
+
+Política de esta rama:
+- **No** forzar `QT_QPA_PLATFORM=xcb`.
+- **No** depender de X11/XWayland como fallback de ejecución.
+- Validar en sesión OBS nativa sobre Wayland.
+
+## Actualización de estabilidad (2026-04-25)
+
+Esta rama ahora incluye un fix de estabilidad en `obs-streamelements-core` para lanzamientos repetidos de OBS.
+
+- Causa raíz observada en coredumps: crash en `linux-pulseaudio.so` (`pa_stream_peek`) durante la enumeración de tipos de source.
+- Mitigación aplicada: la serialización de tipos de source disponibles evita crear sources de audio transitorios cuando no se piden propiedades.
+- Resultado: los lanzamientos repetidos quedaron mucho más estables y no se reprodujo el crash recurrente en la última validación.
+
+Limitación conocida actual (no crash):
+- En Wayland, los paneles web acoplados todavía pueden renderizarse en negro/vacíos/desfasados en el primer acople.
+- Workaround actual: desacoplar y volver a acoplar el panel; luego del re-acople, en las pruebas actuales renderizan correctamente.
+
+Higiene recomendada de runtime:
+- Mantener una sola build activa de `obs-browser` en OBS.
+- Evitar cargar al mismo tiempo `obs-browser` de sistema/distro y `obs-browser` local personalizado.
 
 ## Ejemplos útiles
 
@@ -393,5 +461,6 @@ El script se diseñó para ser reutilizable desde CI. Flujo recomendado:
 
 - Estado actual: **usable** en Linux.
 - Pendiente para estado “estable”:
+  - terminar consistencia de render de paneles acoplados en Wayland (negro/vacío intermitente).
   - Reducir warnings residuales.
   - Seguir auditando leaks intermitentes reportados al cierre de OBS.

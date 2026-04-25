@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 BUILD_DIR="${REPO_ROOT}/build-linux"
 BUILD_TYPE="RelWithDebInfo"
+QT_VERSION="6"
 GENERATOR="Ninja"
 TARGET="obs-streamelements-core"
 JOBS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN || echo 1)"
@@ -27,6 +28,7 @@ Build obs-streamelements-core on Linux.
 Options:
   --build-dir <path>          Build directory (default: ${BUILD_DIR})
   --build-type <type>         CMAKE_BUILD_TYPE (default: ${BUILD_TYPE})
+  --qt-version <5|6>          Qt major version for CMake (default: ${QT_VERSION})
   --generator <name>          CMake generator (default: ${GENERATOR})
   --target <name>             Build target (default: ${TARGET})
   --jobs <n>                  Parallel jobs for cmake --build (default: detected CPU count)
@@ -65,6 +67,11 @@ while [[ $# -gt 0 ]]; do
     --build-type)
       [[ $# -ge 2 ]] || fail "Missing value for --build-type"
       BUILD_TYPE="$2"
+      shift 2
+      ;;
+    --qt-version)
+      [[ $# -ge 2 ]] || fail "Missing value for --qt-version"
+      QT_VERSION="$2"
       shift 2
       ;;
     --generator)
@@ -127,6 +134,10 @@ if [[ "${CONFIGURE_ONLY}" -eq 1 && "${NO_CONFIGURE}" -eq 1 ]]; then
   fail "--configure-only and --no-configure cannot be used together"
 fi
 
+if [[ "${QT_VERSION}" != "5" && "${QT_VERSION}" != "6" ]]; then
+  fail "--qt-version must be either 5 or 6"
+fi
+
 command -v cmake >/dev/null 2>&1 || fail "cmake is required"
 
 if [[ -z "${OBS_BROWSER_DIR}" ]]; then
@@ -154,6 +165,7 @@ if [[ "${NO_CONFIGURE}" -eq 0 ]]; then
     -B "${BUILD_DIR}" \
     -G "${GENERATOR}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+    -DQT_VERSION="${QT_VERSION}" \
     "${CMAKE_ARGS[@]}"
 fi
 
@@ -168,7 +180,9 @@ cmake --build "${BUILD_DIR}" --target "${TARGET}" --parallel "${JOBS}"
 if [[ "${INSTALL_USER}" -eq 1 ]]; then
   SO_PATH=""
   CANDIDATES=(
+    "${BUILD_DIR}/libobs-streamelements-core.so"
     "${BUILD_DIR}/obs-streamelements-core.so"
+    "${BUILD_DIR}/plugins/obs-streamelements-core/libobs-streamelements-core.so"
     "${BUILD_DIR}/plugins/obs-streamelements-core/obs-streamelements-core.so"
   )
 
@@ -180,7 +194,11 @@ if [[ "${INSTALL_USER}" -eq 1 ]]; then
   done
 
   if [[ -z "${SO_PATH}" ]]; then
-    SO_PATH="$(find "${BUILD_DIR}" -maxdepth 5 -type f -name 'obs-streamelements-core.so' | head -n 1 || true)"
+    SO_PATH="$(
+      find "${BUILD_DIR}" -maxdepth 5 -type f \
+        \( -name 'obs-streamelements-core.so' -o -name 'libobs-streamelements-core.so' \) \
+        | head -n 1 || true
+    )"
   fi
 
   [[ -n "${SO_PATH}" ]] || fail "Could not locate obs-streamelements-core.so under ${BUILD_DIR}"

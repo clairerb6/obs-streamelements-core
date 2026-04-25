@@ -1,13 +1,14 @@
 #pragma once
 
+#include <QWidget>
+#include <QHideEvent>
+#include <QCloseEvent>
+#include <QtWidgets>
+
 #include "StreamElementsUtils.hpp"
 #include "StreamElementsBrowserWidget.hpp"
 #include "StreamElementsMessageBus.hpp"
 #include "StreamElementsWebsocketApiServer.hpp"
-
-#include <QWidget>
-#include <QHideEvent>
-#include <QCloseEvent>
 
 #include <util/platform.h>
 #include <util/threading.h>
@@ -21,8 +22,6 @@
 
 #include "StreamElementsVideoComposition.hpp"
 #include "StreamElementsVideoCompositionViewWidget.hpp"
-
-#include <QtWidgets>
 
 #ifdef APPLE
 #include <QMacCocoaViewContainer>
@@ -243,4 +242,3 @@ public:
 	static StreamElementsBrowserWidget *
 	GetWidgetByMessageTargetId(std::string target);
 };
-

@@ -23,11 +23,18 @@
 #include <mutex>
 #include <shared_mutex>
 #include <regex>
+#include <QGuiApplication>
 
 /* ========================================================================= */
 
 static std::shared_mutex s_widgetRegistryMutex;
 static std::map<StreamElementsBrowserWidget *, bool> s_widgetRegistry;
+
+static bool IsWaylandQtPlatform()
+{
+	const QString platformName = QGuiApplication::platformName().toLower();
+	return platformName.contains("wayland");
+}
 
 /* ========================================================================= */
 
@@ -197,8 +204,6 @@ static void UnregisterAppActiveTrackerWidget(QWidget *widget)
 
 /* ========================================================================= */
 
-#include <QVBoxLayout>
-
 #ifndef _WIN32
 static const char* itoa(int input, char* buf, int radix)
 {
@@ -232,7 +237,9 @@ StreamElementsBrowserWidget::StreamElementsBrowserWidget(
 	std::lock_guard<decltype(s_mutex)> guard(s_mutex);
 
 	// Create native window
-	setAttribute(Qt::WA_NativeWindow);
+	if (!IsWaylandQtPlatform()) {
+		setAttribute(Qt::WA_NativeWindow);
+	}
 
 	// Focus on click
 	setFocusPolicy(Qt::ClickFocus);
@@ -242,8 +249,6 @@ StreamElementsBrowserWidget::StreamElementsBrowserWidget(
 	//setMinimumHeight(200);
 
 	setContentsMargins(0, 0, 0, 0);
-	//setLayout(new QVBoxLayout());
-	//layout()->setContentsMargins(0, 0, 0, 0);
 
 	QSizePolicy policy;
 	policy.setHorizontalPolicy(QSizePolicy::MinimumExpanding);
@@ -308,7 +313,9 @@ StreamElementsBrowserWidget::StreamElementsBrowserWidget(
 	}
 
 	m_cefWidgetContainer = new QWidget(this);
-	m_cefWidgetContainer->setAttribute(Qt::WA_NativeWindow);
+	if (!IsWaylandQtPlatform()) {
+		m_cefWidgetContainer->setAttribute(Qt::WA_NativeWindow);
+	}
 
 	m_cefWidget =
 		StreamElementsGlobalStateManager::GetInstance()
@@ -456,6 +463,8 @@ StreamElementsBrowserWidget::StreamElementsBrowserWidget(
 
 	m_cefWidgetContainer->setContentsMargins(0, 0, 0, 0);
 	m_cefWidget->setContentsMargins(0, 0, 0, 0);
+	m_cefWidgetContainer->show();
+	m_cefWidget->show();
 
 	setContentsMargins(0, 0, 0, 0);
 
@@ -666,8 +675,10 @@ void StreamElementsBrowserWidget::SetVideoCompositionView(
 
 	if (!m_activeVideoCompositionViewWidget) {
 		m_activeVideoCompositionViewWidgetContainer = new QWidget(this);
-		m_activeVideoCompositionViewWidgetContainer->setAttribute(
-			Qt::WA_NativeWindow);
+		if (!IsWaylandQtPlatform()) {
+			m_activeVideoCompositionViewWidgetContainer->setAttribute(
+				Qt::WA_NativeWindow);
+		}
 
 		m_activeVideoCompositionViewWidget =
 			new StreamElementsVideoCompositionViewWidget(

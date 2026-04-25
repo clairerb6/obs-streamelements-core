@@ -10,6 +10,7 @@
 #include "cef-headers.hpp"
 
 #include <util/threading.h>
+#include <util/platform.h>
 #include <util/util.hpp>
 
 #include <QPushButton>
@@ -46,6 +47,47 @@ static QString GetLastErrorMsg()
 
 	return result;
 #endif
+}
+
+/* ========================================================================= */
+
+static QCef *CreateObsBrowserPanelWithoutWaylandGate()
+{
+	obs_module_t *browserModule = obs_get_module("obs-browser");
+	if (!browserModule)
+		return nullptr;
+
+	void *lib = obs_get_module_lib(browserModule);
+	if (!lib)
+		return nullptr;
+
+	auto create_qcef =
+		(decltype(&obs_browser_init_panel))os_dlsym(
+			lib, "obs_browser_create_qcef");
+	if (!create_qcef)
+		return nullptr;
+
+	return create_qcef();
+}
+
+static QCef *InitObsBrowserPanelWaylandFirst()
+{
+	QCef *cef = obs_browser_init_panel();
+	if (cef)
+		return cef;
+
+	const char *disableWaylandBypass =
+		getenv("SE_LIVE_DISABLE_WAYLAND_BROWSER_DOCKS_BYPASS");
+	if (disableWaylandBypass &&
+	    strcmp(disableWaylandBypass, "1") == 0) {
+		blog(LOG_WARNING,
+		     "obs-streamelements-core: obs_browser_init_panel() returned null; skipping direct obs-browser symbol lookup because SE_LIVE_DISABLE_WAYLAND_BROWSER_DOCKS_BYPASS=1");
+		return nullptr;
+	}
+
+	blog(LOG_WARNING,
+	     "obs-streamelements-core: obs_browser_init_panel() returned null; trying direct obs-browser symbol lookup (Wayland path)");
+	return CreateObsBrowserPanelWithoutWaylandGate();
 }
 
 /* ========================================================================= */
@@ -392,10 +434,10 @@ void StreamElementsGlobalStateManager::Initialize(QMainWindow *obs_main_window)
 	}
 	int os_mkdirs_ret = os_mkdirs(fullStoragePath.c_str());
 
-	m_cef = obs_browser_init_panel();
+	m_cef = InitObsBrowserPanelWaylandFirst();
 	if (!m_cef) {
 		blog(LOG_ERROR,
-			"obs-streamelements-core: obs_browser_init_panel() failed");
+			"obs-streamelements-core: obs_browser_init_panel() failed (including direct Wayland path)");
 		return;
 	}
 	if (!m_cef->initialized()) {

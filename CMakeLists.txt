@@ -482,6 +482,14 @@ if (APPLE)
   )
 endif()
 
+if(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  # OBS headers pull SIMDe aliases; force native intrinsics first to avoid
+  # GCC 15 conflicts when Qt later includes immintrin.h.
+  target_compile_options(obs-streamelements-core PRIVATE
+    "$<$<COMPILE_LANGUAGE:CXX>:-includeimmintrin.h>"
+  )
+endif()
+
 if (APPLE)
 	list(APPEND obs-streamelements-core_LIBRARIES
 		"-framework AppKit"
