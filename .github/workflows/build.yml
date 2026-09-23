@@ -10,6 +10,16 @@ on:
   push:
     branches:
       - master
+    # A push to master that reaches this workflow runs the Windows and macOS OBS
+    # matrices, consumes a build number, and -- whenever RELEASE_NOTES.md is non-empty --
+    # tags the commit and publishes a prerelease. None of that should happen because
+    # someone fixed a typo on the status page, so the paths that cannot affect the plugin
+    # binary are excluded. GitHub skips the run only when EVERY changed file matches, so
+    # a commit touching both code and docs still builds.
+    paths-ignore:
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+      - 'README.md'
     tags-ignore:
       - '**'
   pull_request:
@@ -18,7 +28,7 @@ on:
 env:
   BASE_BUILD_NUMBER: 569
 
-  BUILD_OPTIONS: >
+  BUILD_OPTIONS: >-
     -DENABLE_DECKLINK=OFF
     -DENABLE_SYPHON=OFF
     -DENABLE_LIBFDK=OFF
@@ -37,9 +47,19 @@ env:
     -DENABLE_SCRIPTING_LUA=OFF
     -DENABLE_UI=OFF
 
+  # Which crash-reporting backend every job compiles in. Single source of truth:
+  # it feeds -DSTREAMELEMENTS_CRASH_HANDLER at each configure site, and symbol
+  # upload will be gated on the same value, so a build's binary and its symbols
+  # cannot end up pointing at different services.
+  SE_CRASH_HANDLER: sentry
+
   BUILD_UNINSTALLER: ${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' }}
   BUILD_INSTALLER: ${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' }}
-  UPLOAD_SYMBOLS: ${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' }}
+  # UPLOAD_SYMBOLS is deliberately NOT defined here. It also depends on
+  # has_release_notes, and workflow-level env cannot read `needs`, so it is
+  # defined in the windows and macos jobs instead. Defining a weaker version
+  # here as well would mean any future job that forgot to redefine it silently
+  # uploaded symbols for builds that are never released.
   UPLOAD_BINARIES: ${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' }}
 
 jobs:
@@ -52,12 +72,20 @@ jobs:
       has_release_notes: ${{ steps.has_release_notes_step.outputs.has_release_notes }}
 
     steps:
+      # Inlined from mlilback/build-number@v1, whose entire main.js was
+      # `core.exportVariable('BUILD_NUMBER', (base + run).toString())`. It ran before
+      # anything else in the pipeline and decided the version every artifact is named
+      # after, on a node12-era third-party tag -- the worst place in these workflows to
+      # trust a moving reference.
+      #
+      # The arithmetic is identical, and the sequence is verified unchanged against the
+      # last three releases: 569+302=871 (26.8.18.871), 569+289=858 (26.8.18.858),
+      # 569+282=851 (26.8.17.851). Keep it as base + run_number: the fleet updater
+      # compares version numbers, so a value that jumps backwards bricks self-update.
+      # se-release/lib.sh documents the same formula and reads it back out of tags.
       - name: Generate build number
-        uses: mlilback/build-number@v1
-        with:
-          base: ${{ env.BASE_BUILD_NUMBER }}
-          run-id: ${{ github.run_number }}
-          # Output: ${{ env.BUILD_NUMBER }} env var
+        # Output: ${{ env.BUILD_NUMBER }} env var
+        run: echo "BUILD_NUMBER=$(( ${{ env.BASE_BUILD_NUMBER }} + ${{ github.run_number }} ))" >> "$GITHUB_ENV"
 
       - name: Generate Version
         id: version_step
@@ -93,29 +121,162 @@ jobs:
 
             echo "has_release_notes=true" >> $GITHUB_OUTPUT
           fi
+
+  # The Claude-written "What's New" blurb, generated once and consumed twice: the
+  # in-app updater reads it out of the manifest (via build-installer), and the
+  # GitHub prerelease body reads it in finalize.
+  #
+  # It is its own job because of ordering. build-installer composes the manifests and
+  # runs *before* finalize, so a blurb generated in finalize does not exist yet when
+  # the manifest is built. Generating it in both places instead would mean two model
+  # calls whose output can differ -- and the point is that a creator reads the same
+  # words in the updater and on the release page.
+  #
+  # Needs no build artifacts: the prompt reads RELEASE_NOTES.md and a changelog
+  # computed from git history, both available immediately after `version`.
+  summary:
+    needs: version
+    if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      # Base64 so a multi-line blurb survives as a job output, and so model text never
+      # passes through GitHub expression interpolation as shell.
+      whats_new_base64: ${{ steps.encode.outputs.whats_new_base64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The changelog is `git log <previous full release>..<head>`.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Resolve previous full release
+        id: prevtag
+        uses: ./.github/actions/se-release
+        with:
+          mode: prevtag
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.version.outputs.version_string }}
+          version-encoded: ${{ needs.version.outputs.version_encoded }}
+
+      - name: Build changelog
+        uses: ./.github/actions/se-release
+        with:
+          mode: changelog
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.version.outputs.version_string }}
+          previous-tag: ${{ steps.prevtag.outputs.previous_tag }}
+          head-ref: ${{ github.sha }}
+          changelog-file: ${{ github.workspace }}/.release-input/changelog.md
+
+      - name: Generate release summary with Claude
+        id: claude_summary
+        # Optional by construction: on failure or timeout the encode step yields an
+        # empty output, the manifest keeps only its notes, and the prerelease is
+        # composed from notes + changelog.
+        continue-on-error: true
+        timeout-minutes: 10
+        # The base action, NOT anthropics/claude-code-action. The wrapper parses the
+        # GitHub event context and rejects anything it does not recognise -- here it
+        # fails immediately with "Unsupported event type: push". The base action has no
+        # such gate. Pinned exactly: it publishes no moving major tag.
+        uses: anthropics/claude-code-base-action@e8132bc5e637a42c27763fc757faa37e1ee43b34 # v0.0.63
+        # Force Task subagents to run in the foreground; same rationale as
+        # claude-code-review.yml. Upstream: anthropics/claude-code-action#1499.
+        env:
+          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Write the "What's New" section for SE.Live (the StreamElements OBS plugin)
+            release ${{ needs.version.outputs.version_string }}.
+
+            The audience is creators -- people who stream and record with OBS. They are
+            not developers and do not know this codebase. Write about what they will
+            notice: what works better, what is new, what no longer breaks.
+
+            Read these files, relative to the repository root:
+              - RELEASE_NOTES.md               release notes written by the team
+              - .release-input/changelog.md    PRs merged since the last release
+
+            Write 2-4 sentences, or up to 4 short bullets.
+
+            Rules:
+            - Use only what is in those files. Invent nothing.
+            - Do not restate the notes verbatim; they are published directly below your
+              text under a "Release Notes" heading.
+            - Skip CI, build-system, refactor and dependency work entirely -- none of it
+              is visible to a creator.
+            - Avoid internal jargon: say "scene switching" rather than naming a class,
+              and describe an effect rather than a code path.
+            - No heading: the workflow adds "What's New" itself.
+            - Plain Markdown, no code fences.
+
+            Reply with the blurb text and nothing else -- no preamble, no JSON, no
+            explanation of what you did. Your entire reply is published verbatim.
+          # v0.0.63's real inputs. `claude_args` belongs to a newer interface that
+          # exists only on the action's main branch; passing it to this tag logs
+          # "Unexpected input(s)" and drops it, which is how earlier attempts silently
+          # ran on the action's retired default model and 404'd. `model` must be its own
+          # input.
+          model: claude-opus-5
+          allowed_tools: Read,Glob,Grep
+          timeout_minutes: '10'
+
+      # v0.0.63 exposes only `conclusion` and `execution_file` -- there is no
+      # `structured_output`, so the blurb is recovered from the transcript.
+      - name: Extract and encode release summary
+        id: encode
+        continue-on-error: true
+        run: |
+          set -eu
+          SUMMARY="${{ github.workspace }}/.release-input/summary.txt"
+
+          node .github/actions/se-release/extract-summary.js \
+            "${{ steps.claude_summary.outputs.execution_file }}" "$SUMMARY" || true
+
+          if [ -s "$SUMMARY" ]; then
+            echo "whats_new_base64=$(base64 --wrap=0 "$SUMMARY")" >> "$GITHUB_OUTPUT"
+            echo "::notice::What's New summary generated ($(wc -c < "$SUMMARY") bytes)"
+          else
+            echo "whats_new_base64=" >> "$GITHUB_OUTPUT"
+            echo "::warning::no What's New summary was produced; the manifest and release will carry release notes only"
+          fi
+
   windows:
     needs: version
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     if: needs.version.outputs.is_workflow_automation != 'true'
 
     env:
-      CHECKOUT: 31.1.2
-      GS_ACCESS_KEY_ID: ${{ secrets.GS_ACCESS_KEY_ID }}
-      GS_KEY_BASE64: ${{ secrets.GS_KEY_BASE64 }}
+      CHECKOUT: 32.2.1
       GITHUB_WORKSPACE: $GITHUB_WORKSPACE
+
+      # Redefined here rather than taken from the workflow-level env, because
+      # that one cannot see `needs` -- only job-level env can. Same condition
+      # plus the release-notes gate.
+      #
+      # A master build with an empty RELEASE_NOTES.md is tagged by nothing,
+      # released by nothing and published by nothing: deploy-signed-* and
+      # finalize are gated on exactly the same output. Uploading its symbols
+      # would file them under a version that does not exist as far as anything
+      # downstream is concerned.
+      UPLOAD_SYMBOLS: ${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' && needs.version.outputs.has_release_notes == 'true' }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Auth Google API
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
           service_account: ${{ vars.GCS_SERVICE_ACCOUNT }}
 
       - name: Add msbuild to PATH
-        uses: microsoft/setup-msbuild@v3
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3
 
       - name: Clone OBS Studio
         shell: cmd
@@ -132,20 +293,12 @@ jobs:
           xcopy "%GITHUB_WORKSPACE%\*.*" "C:\local\obs-studio\plugins\obs-streamelements-core" /S /E /I /Y
           echo add_obs_plugin(obs-streamelements-core) > C:\local\obs-studio\plugins\CMakeLists.txt
 
-      - name: Setup GCS uploader
-        shell: powershell
-        run: |
-          cd C:\local\obs-studio\plugins\obs-streamelements-core\CI\gcs
-          [System.Text.Encoding]::UTF8.GetString(
-            [System.Convert]::FromBase64String($env:GS_KEY_BASE64)
-          ) | Out-File key.json
-          npm install
-
       # Symbol upload is best-effort: BugSplat being unreachable must not fail a build
       # that otherwise compiled and signed correctly. The only consequence is that crash
       # reports for this build are not symbolicated. BugSplat is slated to be replaced by
       # Sentry, so this path is deliberately tolerant rather than hardened.
       - name: Download BugSplat uploader
+        if: env.SE_CRASH_HANDLER == 'bugsplat'
         shell: pwsh
         run: |
           mkdir c:\local\bugsplat
@@ -179,16 +332,16 @@ jobs:
           copy C:\local\obs-studio\plugins\obs-streamelements-core\CMakeUserPresets.json C:\local\obs-studio\CMakeUserPresets.json
           del C:\local\obs-studio\plugins\obs-streamelements-core\CMakeUserPresets.json
           cd /d C:\local\obs-studio
-          cmake --preset=windows-x64-streamelements %BUILD_OPTIONS%
+          cmake --preset=windows-x64-streamelements -DSTREAMELEMENTS_CRASH_HANDLER=%SE_CRASH_HANDLER% %BUILD_OPTIONS%
 
       - name: Build
         shell: cmd
         run: |
-          cd /d C:\local\obs-studio\build_x64
-          msbuild obs-studio.sln -p:Configuration=RelWithDebInfo
+          cd /d C:\local\obs-studio
+          cmake --build build_x64 --config RelWithDebInfo
 
       - name: Upload BugSplat Symbols
-        if: ${{ env.UPLOAD_SYMBOLS == 'true' }}
+        if: ${{ env.UPLOAD_SYMBOLS == 'true' && env.SE_CRASH_HANDLER == 'bugsplat' }}
         shell: cmd
         run: |
           c:\local\bugsplat\symbol-upload-windows.exe ^
@@ -209,6 +362,29 @@ jobs:
 
           exit /b 0
 
+      # Fatal on failure, unlike the BugSplat step above. An unsymbolicated
+      # minidump is a wall of addresses, so a build whose symbols never arrived
+      # is not one worth shipping -- better a red build than a release whose
+      # crash reports cannot be read.
+      #
+      # The directory is scanned rather than named file by file: it holds the
+      # DLL, its PDB and the sentry-crash daemon, and sentry-cli picks up all
+      # three. The DLL matters as much as the PDB -- Sentry matches a minidump's
+      # modules by code ID first, which only the PE carries, and debug files
+      # alone leave those modules unresolved.
+      - name: Upload Sentry symbols
+        if: ${{ env.UPLOAD_SYMBOLS == 'true' && env.SE_CRASH_HANDLER == 'sentry' }}
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: |
+          set -euo pipefail
+
+          npx -y @sentry/cli debug-files upload \
+            "/c/local/obs-studio/build_x64/rundir/RelWithDebInfo/obs-plugins/64bit"
+
       - name: Package
         shell: cmd
         run: |
@@ -224,7 +400,7 @@ jobs:
 
       - name: Upload 64bit build artifact to GCS
         if: github.event_name != 'pull_request'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -233,7 +409,7 @@ jobs:
 
       - name: Upload version header to GCS
         if: github.event_name != 'pull_request'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -242,22 +418,39 @@ jobs:
 
   macos:
     needs: version
-    runs-on: macos-15
+    runs-on: macos-26
     if: needs.version.outputs.is_workflow_automation != 'true'
 
     env:
-      CHECKOUT: 31.1.2
-      GS_SECRET_ACCESS_KEY: ${{ secrets.GS_SECRET_ACCESS_KEY }}
+      CHECKOUT: 32.2.1
+
+      # See the matching comment in the windows job: job-level env is the only
+      # scope that can read `needs`, so the release-notes gate has to be applied
+      # here rather than at workflow level.
+      UPLOAD_SYMBOLS: ${{ github.ref == 'refs/heads/master' && github.event_name != 'pull_request' && needs.version.outputs.has_release_notes == 'true' }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Auth Google API
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
           service_account: ${{ vars.GCS_SERVICE_ACCOUNT }}
+
+      # OBS 32.2.x refuses to configure on anything below the macOS 26.5 SDK --
+      # cmake/macos/compilerconfig.cmake fails outright, before any of our code
+      # is reached. The macos-26 image ships several Xcodes and does not
+      # necessarily default to one new enough, so select it explicitly. This
+      # mirrors what obs-studio's own build-project.yaml does.
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode_26.5.app ]; then
+            sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer
+          fi
+          xcodebuild -version
+          echo "macOS SDK: $(xcrun --sdk macosx --show-sdk-platform-version)"
 
       - name: Clone OBS Studio
         run: |
@@ -280,6 +473,7 @@ jobs:
       # build. chmod moved inside the success branch -- it would fail on a missing file
       # and take the step down with it.
       - name: Download BugSplat uploader
+        if: env.SE_CRASH_HANDLER == 'bugsplat'
         run: |
           cd /tmp
           if curl -sL -f -O https://github.com/BugSplat-Git/symbol-upload/releases/download/v10.5.0/symbol-upload-macos; then
@@ -303,6 +497,7 @@ jobs:
           cmake --preset=macos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -B build_macos_arm64 \
+            -DSTREAMELEMENTS_CRASH_HANDLER=$SE_CRASH_HANDLER \
             $BUILD_OPTIONS
 
           cd build_macos_arm64
@@ -323,6 +518,7 @@ jobs:
           cmake --preset=macos \
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -B build_macos_x86_64 \
+            -DSTREAMELEMENTS_CRASH_HANDLER=$SE_CRASH_HANDLER \
             $BUILD_OPTIONS
 
           cd build_macos_x86_64
@@ -338,7 +534,7 @@ jobs:
       # The subshell covers the cd as well as the upload: a missing build directory would
       # otherwise fail the step before the uploader ever ran.
       - name: Upload ARM64 to BugSplat
-        if: env.UPLOAD_SYMBOLS == 'true'
+        if: env.UPLOAD_SYMBOLS == 'true' && env.SE_CRASH_HANDLER == 'bugsplat'
         run: |
           if ! (
             cd ~/src/obs-studio/build_macos_arm64/plugins/obs-streamelements-core/RelWithDebInfo &&
@@ -348,7 +544,7 @@ jobs:
           fi
 
       - name: Upload x86_64 to BugSplat
-        if: env.UPLOAD_SYMBOLS == 'true'
+        if: env.UPLOAD_SYMBOLS == 'true' && env.SE_CRASH_HANDLER == 'bugsplat'
         run: |
           if ! (
             cd ~/src/obs-studio/build_macos_x86_64/plugins/obs-streamelements-core/RelWithDebInfo &&
@@ -356,6 +552,28 @@ jobs:
           ); then
             echo "::warning title=BugSplat symbol upload failed (macOS x86_64)::x86_64 symbols for ${{ needs.version.outputs.version_string }} were not uploaded, so its crash reports will not be symbolicated. The build itself is unaffected."
           fi
+
+      # Fatal on failure, unlike the BugSplat steps above -- see the matching
+      # comment in the windows job.
+      #
+      # Both slices are uploaded, and each directory is scanned rather than
+      # named file by file: it holds the .dSYM, the plugin bundle whose Mach-O
+      # carries the code ID Sentry matches minidump modules by, and the
+      # sentry-crash daemon inside that bundle.
+      - name: Upload Sentry symbols
+        if: env.UPLOAD_SYMBOLS == 'true' && env.SE_CRASH_HANDLER == 'sentry'
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: |
+          set -euo pipefail
+
+          for arch in arm64 x86_64; do
+            npx -y @sentry/cli debug-files upload \
+              ~/src/obs-studio/build_macos_${arch}/plugins/obs-streamelements-core/RelWithDebInfo
+          done
+
       - name: Package
         run: |
           cd ~/src/obs-studio/build_macos_arm64/plugins/obs-streamelements-core/RelWithDebInfo
@@ -375,7 +593,7 @@ jobs:
 
       - name: Upload ARM64 build artifact to GCS
         if: github.event_name != 'pull_request'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -384,7 +602,7 @@ jobs:
 
       - name: Upload x86_64 build artifact to GCS
         if: github.event_name != 'pull_request'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -393,7 +611,7 @@ jobs:
 
       - name: Upload version header to GCS
         if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -409,8 +627,13 @@ jobs:
     uses: ./.github/workflows/build-obs-streamelements-uninstaller.yml
     secrets: inherit
   build-installer:
-    needs: [ version, build-uninstaller, windows, macos ]
-    if: needs.version.outputs.is_workflow_automation != 'true'
+    # `summary` is a dependency so the blurb reaches the manifest, but always() keeps
+    # the installer building when summary was skipped (no release notes) or failed.
+    # Release prose must never be able to stop a build shipping.
+    needs: [ version, build-uninstaller, windows, macos, summary ]
+    if: always() && needs.version.outputs.is_workflow_automation != 'true' &&
+        needs.build-uninstaller.result == 'success' &&
+        needs.windows.result == 'success' && needs.macos.result == 'success'
     permissions:
       contents: read
       id-token: write # lets the job mint a GitHub OIDC token for WIF
@@ -421,6 +644,9 @@ jobs:
       SKIP_APPLE_SIGNING_AND_NOTARIZATION: ${{ vars.SKIP_APPLE_SIGNING_AND_NOTARIZATION }}
       PLUGIN_VERSION_STRING: ${{ needs.version.outputs.version_string }}
       PLUGIN_VERSION_ENCODED: ${{ needs.version.outputs.version_encoded }}
+      # Empty when summary was skipped or failed; release_notes then composes the
+      # manifest exactly as it did before.
+      WHATS_NEW_BASE64: ${{ needs.summary.outputs.whats_new_base64 }}
 
   deploy-signed-windows:
     needs: [ version, windows, build-installer ]
@@ -435,14 +661,14 @@ jobs:
 
     steps:
       - name: Auth Google API
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
           service_account: ${{ vars.GCS_SERVICE_ACCOUNT }}
 
       - name: Create Custom Status Badge
-        uses: emibcn/badge-action@v2.0.2
+        uses: emibcn/badge-action@4209421db54c8764d8932070ffd0f81715a629bf # v2.0.2
         with:
           label: 'Version'
           status: '${{ needs.version.outputs.version_string }}'
@@ -506,7 +732,7 @@ jobs:
             *.*.version.svg
 
       - name: Upload Binaries to CDN Google Storage
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -515,7 +741,7 @@ jobs:
           destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed'
 
       - name: Upload Manifests to CDN Google Storage
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -525,22 +751,6 @@ jobs:
           headers: |
             content-type: text/plain; charset=utf-8
 
-      - name: Upload signed installers to VirusTotal Monitor
-        uses: StreamElements/virustotal-monitor-action@v1
-        with:
-          # The action has no default and reads no environment variable — the key is always passed
-          # in. Point this at whatever your repo or org calls the secret.
-          api-key: ${{ secrets.VT_MONITOR_API_KEY }}
-          mode: upload
-          version: ${{ needs.version.outputs.version_encoded }}
-          path-prefix: /obs-streamelements-core/windows
-          files: |
-            ${{ github.workspace }}/obs-streamelements-setup-${{ needs.version.outputs.version_encoded }}.exe
-            ${{ github.workspace }}/obs-streamelements-setup-${{ needs.version.outputs.version_encoded }}-64bit.exe
-          # Upload failures are loud: a release that AV vendors never see is the problem this solves.
-          on-error: fail
-          verbose: true
-
   deploy-signed-macos:
     needs: [ version, macos, build-installer ]
     runs-on: ubuntu-latest
@@ -549,14 +759,14 @@ jobs:
 
     steps:
       - name: Auth Google API
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
           service_account: ${{ vars.GCS_SERVICE_ACCOUNT }}
 
       - name: Create Custom Status Badge
-        uses: emibcn/badge-action@v2.0.2
+        uses: emibcn/badge-action@4209421db54c8764d8932070ffd0f81715a629bf # v2.0.2
         with:
           label: 'Version'
           status: '${{ needs.version.outputs.version_string }}'
@@ -604,7 +814,7 @@ jobs:
             *.manifest
           
       - name: Upload Binaries to CDN Google Storage
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -613,7 +823,7 @@ jobs:
           destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/macos/signed'
 
       - name: Upload Manifests to CDN Google Storage
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -627,171 +837,102 @@ jobs:
     # Note this job is now skipped entirely for a build with an empty RELEASE_NOTES.md:
     # it needs deploy-signed-*, those are gated on has_release_notes, and GitHub skips a
     # job whose dependencies were skipped. That is the intended outcome -- every step
-    # below is already individually gated on has_release_notes, with one exception, the
-    # VirusTotal prune. Losing the prune on notes-less builds is consistent rather than a
-    # gap: the matching VirusTotal upload lives in deploy-signed-windows and is skipped
-    # too, so no new files were submitted, and release.yml prunes again on every
-    # non-dry-run promotion. The same implicit skip already happens when
-    # SKIP_WINDOWS_SIGNING or SKIP_APPLE_SIGNING_AND_NOTARIZATION is set.
+    # below is individually gated on has_release_notes anyway. The same implicit skip
+    # already happens when SKIP_WINDOWS_SIGNING or SKIP_APPLE_SIGNING_AND_NOTARIZATION
+    # is set.
     if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
-    needs: [version, windows, macos, build-uninstaller, build-installer, deploy-signed-macos, deploy-signed-windows]
+    needs: [version, windows, macos, build-uninstaller, build-installer, deploy-signed-macos, deploy-signed-windows, summary]
     runs-on: ubuntu-latest
 
     steps:
+      # Inlined from tvdias/github-tagger@v0.0.1, which was one createRef call on
+      # github.context.sha -- reproduced exactly, including the failure on a tag that
+      # already exists (the action did not force-update either, so a re-run of an
+      # already-tagged version still stops here rather than silently moving a tag that
+      # a release points at). This runs before the checkout below, so it has to go
+      # through the API rather than `git tag`.
       - name: Tag master commit
-        uses: tvdias/github-tagger@v0.0.1
         if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        with:
-          repo-token: "${{ secrets.GITHUB_TOKEN }}"
-          tag: "${{ needs.version.outputs.version_string }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.version_string }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$TAG" \
+            -f "sha=$GITHUB_SHA"
 
       - uses: actions/checkout@v4
         if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
         with:
           ssh-key: ${{ secrets.RELEASE_BOT_SSH_KEY }}
-          # The prerelease changelog is `git log <previous full release>..<sha>`, which
-          # needs the whole history and every tag. blob:none keeps it cheap: git log
-          # never reads file contents, and this repo's .git is ~120 MB.
+          # A full clone, because "Clear RELEASE_NOTES.md" below commits and pushes,
+          # which a shallow clone cannot do reliably. blob:none keeps it cheap: nothing
+          # here reads historical file contents, and this repo's .git is ~120 MB.
           fetch-depth: 0
           filter: blob:none
 
-      # The four steps below must stay between the checkout above (which puts
+      # The two steps below must stay between the checkout above (which puts
       # RELEASE_NOTES.md on disk) and "Clear RELEASE_NOTES.md" below (which truncates it
       # and pushes the truncation). This is the last point at which the notes for this
       # build exist anywhere.
-      - name: Resolve previous full release
-        id: prevtag
+      # The blurb is not generated here. It comes from the `summary` job, which runs
+      # early enough for build-installer to bake the same text into the manifests, so
+      # the in-app updater and the release page cannot disagree. Decoded here into the
+      # file the notes step below reads.
+      - name: Decode release summary
         if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        uses: ./.github/actions/se-release
-        with:
-          mode: prevtag
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ needs.version.outputs.version_string }}
-          version-encoded: ${{ needs.version.outputs.version_encoded }}
-
-      - name: Build changelog
-        if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        uses: ./.github/actions/se-release
-        with:
-          mode: changelog
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ needs.version.outputs.version_string }}
-          previous-tag: ${{ steps.prevtag.outputs.previous_tag }}
-          # Walk to the built commit rather than the tag: the tagger step ran seconds ago
-          # and the tag may not have reached this clone yet.
-          head-ref: ${{ github.sha }}
-          changelog-file: ${{ github.workspace }}/.release-input/changelog.md
-
-      - name: Generate release summary with Claude
-        id: claude_summary
-        if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        # Optional by construction: on failure or timeout the guarded expression below
-        # yields an empty summary and the prerelease is composed from notes + changelog.
         continue-on-error: true
-        timeout-minutes: 10
-        # The base action, NOT anthropics/claude-code-action. The wrapper parses the
-        # GitHub event context and rejects anything it does not recognise -- on this job
-        # it fails immediately with "Unsupported event type: push", because finalize runs
-        # inside the push-triggered Build workflow. The base action has no such gate; it
-        # just runs Claude Code, which is all this step needs.
-        # Pinned to an exact version: the base action publishes no moving major tag.
-        uses: anthropics/claude-code-base-action@v0.0.63
-        # Force Task subagents to run in the foreground; same rationale as
-        # claude-code-review.yml, which documents the mechanism.
-        # Upstream: anthropics/claude-code-action#1499.
         env:
-          CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          prompt: |
-            Write the "What's New" section for SE.Live (the StreamElements OBS plugin)
-            release ${{ needs.version.outputs.version_string }}.
-
-            The audience is creators -- people who stream and record with OBS. They are
-            not developers and do not know this codebase. Write about what they will
-            notice: what works better, what is new, what no longer breaks.
-
-            Read these files, relative to the repository root:
-              - RELEASE_NOTES.md               release notes written by the team
-              - .release-input/changelog.md    PRs merged since the last release
-
-            Write 2-4 sentences, or up to 4 short bullets.
-
-            Rules:
-            - Use only what is in those files. Invent nothing.
-            - Do not restate the notes verbatim; they are published directly below your
-              text under a "Release Notes" heading.
-            - Skip CI, build-system, refactor and dependency work entirely -- none of it
-              is visible to a creator.
-            - Avoid internal jargon: say "scene switching" rather than naming a class,
-              and describe an effect rather than a code path.
-            - No heading: the workflow adds "## What's New" itself.
-            - Plain Markdown, no code fences.
-
-            Reply with the blurb text and nothing else -- no preamble, no JSON, no
-            explanation of what you did. Your entire reply is published verbatim.
-          # These are v0.0.63's real inputs. `claude_args` belongs to a newer interface
-          # that exists only on the action's main branch: passing it to this tag logs
-          # "Unexpected input(s) 'claude_args'" and drops it wholesale -- which is why
-          # earlier attempts still ran on the action's default model,
-          # claude-sonnet-4-20250514, and failed with a 404 because that model is
-          # retired. `model` must therefore be set as its own input.
-          model: claude-opus-5
-          allowed_tools: Read,Glob,Grep
-          timeout_minutes: '10'
-
-      # v0.0.63 exposes only `conclusion` and `execution_file` -- there is no
-      # `structured_output`, so the blurb is recovered from the transcript. Writing it
-      # to a file rather than a step output keeps model text out of GitHub expression
-      # interpolation entirely.
-      - name: Extract release summary
-        if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        continue-on-error: true
+          # Model-authored text: passed as an environment variable and decoded, never
+          # interpolated into the script body.
+          WHATS_NEW_BASE64: ${{ needs.summary.outputs.whats_new_base64 }}
         run: |
-          node .github/actions/se-release/extract-summary.js \
-            "${{ steps.claude_summary.outputs.execution_file }}" \
-            "${{ github.workspace }}/.release-input/summary.txt"
+          set -eu
+          mkdir -p "${{ github.workspace }}/.release-input"
 
-      - name: Create GitHub prerelease
+          if [ -n "${WHATS_NEW_BASE64:-}" ]; then
+            echo "$WHATS_NEW_BASE64" | base64 -d > "${{ github.workspace }}/.release-input/summary.txt"
+            echo "::notice::reusing the What's New summary from the summary job"
+          else
+            : > "${{ github.workspace }}/.release-input/summary.txt"
+            echo "::warning::no What's New summary was produced; composing from notes and changelog only"
+          fi
+
+      # The GitHub release is NOT created here any more. release.yml creates it on the
+      # first promotion and relabels it at each hop, so the releases page lists builds
+      # that actually reached a channel rather than every master build carrying notes.
+      #
+      # What must still happen at build time is composing the release notes artifact.
+      # RELEASE_NOTES.md is truncated and pushed a few steps below, and the What's New
+      # blurb comes from the `summary` job of this run; neither survives to promotion
+      # time. The artifact is uploaded to signed/ below and travels with the manifest,
+      # so every hop composes its body from the same text and the wording cannot drift
+      # between [ALPHA], [BETA] and the full release.
+      #
+      # No changelog is composed here for the same reason it is not in the artifact: it
+      # is relative to the previous full release, which moves between promotions.
+      - name: Compose the release notes artifact
         if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
         uses: ./.github/actions/se-release
         with:
-          mode: prerelease
+          mode: notes
           github-token: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ needs.version.outputs.version_string }}
           notes-file: RELEASE_NOTES.md
-          changelog-file: ${{ github.workspace }}/.release-input/changelog.md
-          # Also makes the step write obs-streamelements.release_notes.md here, for the
-          # CDN upload below.
+          # Writes obs-streamelements.release_notes.md here, for the CDN upload below.
           output-dir: ${{ github.workspace }}/.release-input
-          # Absent or empty whenever generation failed; the body is then composed from
-          # notes + changelog alone.
+          # Absent or empty whenever generation failed; the artifact is then the
+          # hand-written notes alone.
           summary-file: ${{ github.workspace }}/.release-input/summary.txt
-          dry-run: 'false'
-
-      # Attach the signed installers. Runs after the release exists and after
-      # deploy-signed-* has published them, reading the URLs from the manifest rather
-      # than rebuilding them from the version -- the manifest is the contract the
-      # in-app updater already follows, so the release ships exactly what it points at.
-      # Best-effort: a failure here leaves the release valid, just without binaries.
-      - name: Attach installers to the release
-        if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        continue-on-error: true
-        uses: ./.github/actions/se-release
-        with:
-          mode: assets
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ needs.version.outputs.version_string }}
-          version-encoded: ${{ needs.version.outputs.version_encoded }}
-          dry-run: 'false'
 
       # Publish the blurb + notes next to the manifest in signed/, so promotion can reuse
       # the text instead of regenerating it, and so the notes for a given build follow
       # that build through the channels. Uploaded here rather than from deploy-signed-*
-      # because the blurb does not exist until the step above has run.
+      # because the artifact does not exist until the step above has run.
       - name: Auth Google API
         if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
@@ -799,7 +940,7 @@ jobs:
 
       - name: Upload release notes to windows/signed
         if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -812,7 +953,7 @@ jobs:
 
       - name: Upload release notes to macos/signed
         if: needs.version.outputs.is_workflow_automation != 'true' && needs.version.outputs.has_release_notes == 'true'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -829,7 +970,13 @@ jobs:
           git config --global user.email "release-bot@obs-streamelements-core"
           git config --global user.name "SE.Live Release Bot"
 
-          # Prepend current relase notes to release notes history
+          # Prepend current relase notes to release notes history.
+          #
+          # RELEASE_NOTES.md only -- the "What's New" blurb is deliberately NOT archived.
+          # It is model-authored prose regenerated per release for the manifest and the
+          # GitHub release body; persisting it here would bake it into every future
+          # build's notes and grow the history with text nobody wrote. Keep this reading
+          # from RELEASE_NOTES.md and never from the composed release_notes_raw.md.
 
           echo "### ${{ needs.version.outputs.version_string }}" >> /tmp/RELEASE_NOTES.history.md
           echo "" >> /tmp/RELEASE_NOTES.history.md
@@ -849,40 +996,3 @@ jobs:
           git add RELEASE_NOTES.history.md
           git commit -m "[WORKFLOW-AUTOMATION] ${{ needs.version.outputs.version_string }} finalize build"
           git push
-
-      - name: Prune old versions from VirusTotal Monitor
-        uses: streamelements/virustotal-monitor-action@v1
-        with:
-          # The action has no default and reads no environment variable — the key is always
-          # passed in. Point this at whatever your repo or org calls the secret.
-          api-key: ${{ secrets.VT_MONITOR_API_KEY }}
-          mode: prune
-          managed-prefixes: /obs-streamelements-core
-          quota-bytes: ${{ vars.VT_MONITOR_QUOTA_BYTES || '1GiB' }}
-          high-watermark: ${{ inputs.high-watermark || vars.VT_MONITOR_HIGH_WATERMARK || '80' }}
-          target-watermark: ${{ inputs.target-watermark || vars.VT_MONITOR_TARGET_WATERMARK || '60' }}
-          keep-versions: ${{ vars.VT_MONITOR_KEEP_VERSIONS || '3' }}
-          # Anything these point at is never deleted. If any of them cannot be fetched, the
-          # step fails rather than pruning with an incomplete picture of what is live.
-          #
-          # Each channel is its own directory holding one obs-streamelements.manifest; signed/
-          # additionally pins the most recent signed build. The channels disagree about
-          # installer filenames (signed/ uses -<version>.exe and -<version>-64bit.exe, qa/beta/
-          # latest use -x86-/-x64-, stable drops the version from the filename entirely), so
-          # matching keys off version_number, which all five carry.
-          manifest-urls: |
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.manifest
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/qa/obs-streamelements.manifest
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/beta/obs-streamelements.manifest
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/latest/obs-streamelements.manifest
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/stable/obs-streamelements.manifest
-          # Public-API allowances by default. A prune walks the tree and deletes per version, so
-          # at 4/minute expect a few minutes of wall clock; raise these if the key allows more.
-          rate-limit-per-minute: ${{ vars.VT_MONITOR_RATE_PER_MINUTE || '4' }}
-          rate-limit-per-day: ${{ vars.VT_MONITOR_RATE_PER_DAY || '500' }}
-          rate-limit-per-month: ${{ vars.VT_MONITOR_RATE_PER_MONTH || '15500' }}
-          # Scheduled runs default to enforcing; manual runs default to previewing.
-          dry-run: false
-          # Storage housekeeping must never take a release down with it.
-          on-error: warn
-          verbose: true

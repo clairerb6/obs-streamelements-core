@@ -566,28 +566,44 @@ Section "${PRODUCT_SHORT_NAME} Add-On" section_install_streamelements
     # Data
     #########################################################################
 
-    !ifndef SKIP_64BIT_CONTENT
-        SetOutPath $INSTDIR\data\obs-plugins\obs-streamelements-core
+    SetOutPath $INSTDIR\data\obs-plugins\obs-streamelements-core
 
-        File /r ..\download\obs-streamelements-core\build64_qt6\data\obs-plugins\obs-streamelements-core\*.*
-    !else
-        !ifndef SKIP_32BIT_CONTENT
-            SetOutPath $INSTDIR\data\obs-plugins\obs-streamelements-core
-
-            File /r ..\download\obs-streamelements-core\build32_qt6\data\obs-plugins\obs-streamelements-core\*.*
-        !endif
-    !endif
+    File /r ..\download\obs-streamelements-core\build64_qt6\data\obs-plugins\obs-streamelements-core\*.*
 
     #########################################################################
     # 64 bit
     #########################################################################
-!ifndef SKIP_64BIT_CONTENT
     SetOutPath $INSTDIR\bin\64bit
 
-    File ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BsSndRpt64.exe
-    File ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BugSplat64.dll
-    File ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BugSplatHD64.exe
-    File ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BugSplatRc64.dll
+    # Clear BOTH crash backends before laying down whichever this build carries.
+    #
+    # The File lines below are /nonfatal precisely because only one backend is
+    # ever present, which means an upgrade that switches backends used to leave
+    # the previous one on disk untouched -- observed after installing a Sentry
+    # build over a BugSplat one: BugSplat64.dll, BugSplatHD64.exe and
+    # BugSplatRc64.dll were all still in bin\64bit. Nothing loads them, but they
+    # are dead weight that survives every future upgrade, and the uninstaller is
+    # no help because nobody uninstalls between upgrades.
+    #
+    # Deleting first and restoring from the package is simpler than teaching the
+    # installer which backend it is carrying, and is correct in both directions.
+    # The sentry daemon lives in obs-plugins\64bit, so it is cleared there.
+    Delete "$INSTDIR\bin\64bit\BsSndRpt64.exe"
+    Delete "$INSTDIR\bin\64bit\BugSplat64.dll"
+    Delete "$INSTDIR\bin\64bit\BugSplatHD64.exe"
+    Delete "$INSTDIR\bin\64bit\BugSplatRc64.dll"
+    Delete "$INSTDIR\obs-plugins\64bit\sentry-crash.exe"
+    Delete "$INSTDIR\obs-plugins\64bit\se-crash-wer.dll"
+    Delete "$INSTDIR\obs-plugins\64bit\sentry-wer.dll"
+
+    # /nonfatal on the crash-reporting runtime: which of these exists depends on
+    # STREAMELEMENTS_CRASH_HANDLER at build time, and the installer has no way to
+    # know which backend was compiled. A Sentry build ships no BugSplat DLLs, a
+    # BugSplat build ships no sentry-crash.exe, and neither should fail packaging.
+    File /nonfatal ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BsSndRpt64.exe
+    File /nonfatal ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BugSplat64.dll
+    File /nonfatal ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BugSplatHD64.exe
+    File /nonfatal ..\download\obs-streamelements-core\build64_qt6\bin\64bit\BugSplatRc64.dll
 
     SetOutPath $INSTDIR\obs-plugins\64bit\locales
 
@@ -600,6 +616,35 @@ Section "${PRODUCT_SHORT_NAME} Add-On" section_install_streamelements
     
     File /nonfatal ..\download\obs-streamelements-core\build64_qt6\obs-plugins\64bit\obs-streamelements-set-machine-config.*
 
+    # The Sentry crash daemon. It writes and uploads the minidump out of
+    # process, and the handler looks for it beside its own module -- so it has
+    # to land here, next to obs-streamelements-core.dll, not in bin\64bit.
+    # /nonfatal because a BugSplat build does not produce it.
+    File /nonfatal ..\download\obs-streamelements-core\build64_qt6\obs-plugins\64bit\sentry-crash.exe
+
+    # The two WER runtime exception modules (CORE-864). Heap corruption and
+    # every __fastfail bypass SEH, so nothing in the crashing process ever sees
+    # them; these are what capture that class, out of process, from inside
+    # WerFault.exe.
+    #
+    # se-crash-wer.dll is ours. It applies the module-of-interest gate and the
+    # standing-consent check, then forwards to sentry's module. The handler
+    # registers it by absolute path, resolved beside its own module, which is
+    # why it can live here.
+    #
+    # sentry-wer.dll must land HERE and nowhere else, and specifically NOT in
+    # bin\64bit next to obs64.exe. sentry-native's wer_default_path() joins
+    # "sentry-wer.dll" onto the host executable's directory and registers
+    # whatever it finds there; a copy in bin\64bit would therefore get
+    # registered by sentry itself, and sentry's module claims every fast-fail
+    # in the process -- OBS's own and every other plug-in's -- with no gate at
+    # all. Keeping it here is what keeps ours the only registered module.
+    #
+    # /nonfatal for the same reason as the daemon above: a BugSplat build
+    # produces neither.
+    File /nonfatal ..\download\obs-streamelements-core\build64_qt6\obs-plugins\64bit\se-crash-wer.dll
+    File /nonfatal ..\download\obs-streamelements-core\build64_qt6\obs-plugins\64bit\sentry-wer.dll
+
     Delete /REBOOTOK "$OUTDIR\obs-streamelements.dll"
     Delete /REBOOTOK "$OUTDIR\obs-streamelements.pdb"
 
@@ -607,7 +652,6 @@ Section "${PRODUCT_SHORT_NAME} Add-On" section_install_streamelements
     Delete "$OUTDIR\obs-streamelements.qt5.pdb"
     Delete "$OUTDIR\obs-streamelements-core.qt5.dymod"
     Delete "$OUTDIR\obs-streamelements-core.qt5.pdb"
-!endif
 
     #########################################################################
     # 32 bit
@@ -623,33 +667,34 @@ Section "${PRODUCT_SHORT_NAME} Add-On" section_install_streamelements
 
     setup_obs_32:
 
-!ifndef SKIP_32BIT_CONTENT
-    SetOutPath $INSTDIR\bin\32bit
-
-    File ..\download\obs-streamelements-core\build32_qt6\bin\32bit\BsSndRpt.exe
-    File ..\download\obs-streamelements-core\build32_qt6\bin\32bit\BugSplat.dll
-    File ..\download\obs-streamelements-core\build32_qt6\bin\32bit\BugSplatHD.exe
-    File ..\download\obs-streamelements-core\build32_qt6\bin\32bit\BugSplatRc.dll
-
-    SetOutPath $INSTDIR\obs-plugins\32bit\locales
-
-    File /nonfatal ..\download\obs-streamelements-core\build32_qt6\obs-plugins\32bit\locales\*.*
-
-    SetOutPath $INSTDIR\obs-plugins\32bit
-
-    File /oname=obs-streamelements-core.dll ..\download\obs-streamelements-core\build32_qt6\obs-plugins\32bit\obs-streamelements-core.dll
-    File /oname=obs-streamelements-core.pdb ..\download\obs-streamelements-core\build32_qt6\obs-plugins\32bit\obs-streamelements-core.pdb
-    
-    File /nonfatal ..\download\obs-streamelements-core\build32_qt6\obs-plugins\32bit\obs-streamelements-set-machine-config.*
-
-    Delete /REBOOTOK "$OUTDIR\obs-streamelements.dll"
-    Delete /REBOOTOK "$OUTDIR\obs-streamelements.pdb"
-
-    Delete "$OUTDIR\obs-streamelements.qt5.dymod"
-    Delete "$OUTDIR\obs-streamelements.qt5.pdb"
-    Delete "$OUTDIR\obs-streamelements-core.qt5.dymod"
-    Delete "$OUTDIR\obs-streamelements-core.qt5.pdb"
-!endif
+    #
+    # Nothing happens here any more (CORE-416).
+    #
+    # We stopped shipping 32-bit. The "32-bit installer" was built from a
+    # build32_qt6.zip that nothing has produced for a long time -- a legacy
+    # object still sitting in the bucket -- and the deploy step papered over
+    # that by publishing the x64 exe under the 32-bit filename, so what users
+    # actually received was already x64.
+    #
+    # Everything that used to stand here sat inside !ifndef SKIP_32BIT_CONTENT,
+    # and CI always passed that define for the installer it shipped. So it was
+    # already dead code in the only build anyone ever ran. Verified rather than
+    # assumed: compiling HEAD with /DSKIP_32BIT_CONTENT and this revision with
+    # no defines, against the same input tree, produces an identical NSIS
+    # payload -- all 3,132,685 bytes of header, install code, string table and
+    # data block. The only differing bytes are five in an alignment gap in
+    # .rsrc that NSIS never zeroes, plus the CRC32 that covers them.
+    #
+    # Note what is deliberately NOT here: cleanup of stale 32-bit files. Those
+    # Delete lines were inside the same guard, so the x64 installer never ran
+    # them either. Keeping them would be a behaviour change dressed up as a
+    # deletion. The uninstaller still clears them.
+    #
+    # The RunningX64 check and the two labels stay. They cost two instructions,
+    # they are what keeps this compile identical to the previous one, and the
+    # 32-bit OBS *host* detection further down is a separate concern from
+    # whether we ship a 32-bit plug-in.
+    #
 
 skip_obs_32:
 
@@ -903,11 +948,7 @@ Function DownloadAndInstallOBS
     ${If} ${RunningX64}
         ; Check if we can skip 32-bit installation on 64-bit system
 
-!ifndef SKIP_64BIT_CONTENT
         IfFileExists "$INSTDIR\bin\32bit\obs32.exe" get_obs_32 skip_obs_32
-!else
-        goto get_obs_32
-!endif
     ${Else}
         goto get_obs_32
     ${EndIf}
@@ -919,7 +960,9 @@ get_obs_32:
     StrCpy $g_obsTempPath32 "$g_obsTempPath32.exe"
 
     StrCpy $g_downloadTargetPath $g_obsTempPath32
-    StrCpy $g_downloadText "OBS Studio (Win32) ${OBS_DOWNLOAD_VERSION}"
+    ; No version in this caption on purpose: the 32-bit URL is the last x86 build
+    ; OBS ever shipped, not ${OBS_DOWNLOAD_VERSION}.
+    StrCpy $g_downloadText "OBS Studio (Win32)"
     StrCpy $g_downloadUrl "${OBS_DOWNLOAD_URL_32}"
     Call DownloadRequiredFile
 

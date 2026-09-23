@@ -16,6 +16,7 @@ on:
         options:
           - windows
           - macos
+          - both
         required: true
         default: windows
 
@@ -33,14 +34,6 @@ on:
         default: true
         required: true
 
-      linear-dry-run:
-        description: >-
-          Scan commits and read from Linear, but write nothing to it. Separate from
-          dry-run so a real promotion can still leave Linear untouched while the issue
-          detection is being validated. A dry-run promotion forces this on regardless.
-        type: boolean
-        default: true
-        required: true
 
       is-rollback:
         type: boolean
@@ -52,22 +45,45 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
-    # Only two of the five transitions that "Validate Input" permits touch a GitHub
-    # release at all. Naming them once here keeps the same boolean out of several `if:`
-    # expressions further down.
+    strategy:
+      # `both` runs this job twice, which is what promoting a version has always
+      # meant -- every hop below is convergent precisely because each version is
+      # promoted once per platform, and the second pass only re-asserts what the
+      # first wrote. Selecting `both` just stops that being two manual dispatches.
+      #
+      # Serialised, never parallel. The two legs share one GitHub release and one
+      # Linear release; running them at the same time would have them racing to
+      # create the same objects, and "convergent" only holds if the passes are
+      # ordered.
+      max-parallel: 1
+      # Stop if the first platform fails, rather than promoting the second on top
+      # of a broken hop. This matches what dispatching twice by hand would do.
+      fail-fast: true
+      matrix:
+        platform: ${{ fromJSON(github.event.inputs.platform == 'both' && '["windows","macos"]' || format('["{0}"]', github.event.inputs.platform)) }}
+
+    # Which transitions touch a GitHub release. Naming them once here keeps the same
+    # booleans out of several `if:` expressions further down.
     #
-    #   beta -> latest     a build reaches users: cut the full release (req 1)
+    #   signed -> qa       the release is CREATED, as a prerelease titled [ALPHA]. This
+    #                      is the first time the build exists anywhere but signed/, and
+    #                      it is where the installers are attached.
+    #   qa -> beta         relabelled [BETA], still a prerelease. Also where the Linear
+    #                      release is created and its issues attached.
+    #   beta -> latest     a build reaches users: the full release (req 1)
     #   stable -> latest   an older build is restored onto `latest`, displacing whatever
     #                      was there: that displaced release goes back to [BETA] (req 11)
     #
-    # latest -> beta is deliberately absent. It copies latest's manifest onto `beta` and
-    # leaves `latest` serving the same build, so nothing is taken away from users and no
-    # release changes.
+    # build.yml creates nothing. A build that is never promoted has a tag and no release,
+    # which is the point: the releases page lists what shipped somewhere rather than
+    # every master build that happened to carry notes.
     #
-    # Linear tracks one more hop than GitHub does. `qa -> beta` creates no release here --
-    # nothing has shipped to anyone yet -- but it is the point at which the build is worth
-    # announcing, so it is where the Linear release is created and its issues attached.
+    # latest -> beta is deliberately absent. It copies latest's manifest onto `beta` and
+    # leaves `latest` serving the same build, so nothing is taken away from users; the
+    # release stays full rather than being relabelled back to [BETA].
     env:
+      # Every forward promotion now writes the GitHub release for the version it moves.
+      SE_RELEASE_HOP: ${{ (github.event.inputs.to == 'qa' || github.event.inputs.to == 'beta' || github.event.inputs.to == 'latest') && github.event.inputs.is-rollback != 'true' }}
       SE_PROMOTE: ${{ github.event.inputs.to == 'latest' && github.event.inputs.is-rollback != 'true' }}
       SE_ROLLBACK: ${{ github.event.inputs.is-rollback == 'true' && github.event.inputs.from == 'stable' && github.event.inputs.to == 'latest' }}
       SE_LINEAR_BETA: ${{ github.event.inputs.to == 'beta' && github.event.inputs.is-rollback != 'true' }}
@@ -75,13 +91,15 @@ jobs:
       # usable in a fork or a clone that has no pipeline access key.
       SE_HAS_LINEAR: ${{ secrets.LINEAR_ACCESS_KEY != '' }}
       # A dry-run promotion must not write to Linear either -- otherwise rehearsing a
-      # promotion would leave a real release behind.
-      SE_LINEAR_DRY_RUN: ${{ (github.event.inputs.dry-run == 'true' || github.event.inputs.linear-dry-run == 'true') && 'true' || 'false' }}
+      # promotion would leave a real release behind. There is no separate Linear opt-out:
+      # the stage a release sits on is part of the promotion, not a thing to rehearse
+      # independently of it.
+      SE_LINEAR_DRY_RUN: ${{ github.event.inputs.dry-run }}
 
     steps:
       - name: debug
         run: |
-          echo "${{ github.event.inputs.platform }}: ${{ github.event.inputs.from }} -> ${{ github.event.inputs.to }}   (dry-run: ${{ github.event.inputs.dry-run }} ${{ github.event.inputs.dry-run == 'true' }})"
+          echo "${{ matrix.platform }}: ${{ github.event.inputs.from }} -> ${{ github.event.inputs.to }}   (dry-run: ${{ github.event.inputs.dry-run }} ${{ github.event.inputs.dry-run == 'true' }})"
       - name: Validate Input
         run: |
           if [ "${{ github.event.inputs.from }}" = "${{ github.event.inputs.to }}" ]; then
@@ -149,7 +167,7 @@ jobs:
               exit 1
           fi
 
-          echo "::notice::validation passed for transfer from '${{ github.event.inputs.from }}' to '${{ github.event.inputs.to}}' on ${{ github.event.inputs.platform}} (dry-run: ${{ github.event.inputs.dry-run }}; is-rollback: ${{ github.event.inputs.is-rollback }})"
+          echo "::notice::validation passed for transfer from '${{ github.event.inputs.from }}' to '${{ github.event.inputs.to}}' on ${{ matrix.platform}} (dry-run: ${{ github.event.inputs.dry-run }}; is-rollback: ${{ github.event.inputs.is-rollback }})"
 
       - uses: actions/checkout@v4
         with:
@@ -160,7 +178,7 @@ jobs:
           filter: blob:none
 
       - name: Auth Google API
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
@@ -169,7 +187,7 @@ jobs:
       - name: Download manifest, version SVG and release notes
         id: download
         run: |
-          curl -f --output obs-streamelements.manifest https://cdn.streamelements.com/obs/dist/obs-streamelements/${{ github.event.inputs.platform }}/${{ github.event.inputs.from }}/obs-streamelements.manifest
+          curl -f --output obs-streamelements.manifest https://cdn.streamelements.com/obs/dist/obs-streamelements/${{ matrix.platform }}/${{ github.event.inputs.from }}/obs-streamelements.manifest
 
           # The version badge is cosmetic -- it is the image the README embeds -- and it
           # is missing from beta, latest and stable on both platforms. Fetching it with
@@ -182,7 +200,7 @@ jobs:
           # would be worse than none. So the upload is skipped instead and the
           # destination keeps whatever badge it had.
           if curl -fsS --output obs-streamelements.version.svg \
-              "https://cdn.streamelements.com/obs/dist/obs-streamelements/${{ github.event.inputs.platform }}/${{ github.event.inputs.from }}/obs-streamelements.version.svg"; then
+              "https://cdn.streamelements.com/obs/dist/obs-streamelements/${{ matrix.platform }}/${{ github.event.inputs.from }}/obs-streamelements.version.svg"; then
             echo "has_version_svg=true" >> $GITHUB_OUTPUT
           else
             echo "::warning::no obs-streamelements.version.svg on '${{ github.event.inputs.from }}'; the version badge on '${{ github.event.inputs.to }}' will not be updated"
@@ -199,7 +217,7 @@ jobs:
           # destination's previous notes in place would leave it describing a build it no
           # longer points at. Writing the placeholder keeps all three in step.
           if curl -fsS --output obs-streamelements.release_notes.md \
-              "https://cdn.streamelements.com/obs/dist/obs-streamelements/${{ github.event.inputs.platform }}/${{ github.event.inputs.from }}/obs-streamelements.release_notes.md"; then
+              "https://cdn.streamelements.com/obs/dist/obs-streamelements/${{ matrix.platform }}/${{ github.event.inputs.from }}/obs-streamelements.release_notes.md"; then
             echo "::notice::fetched release notes from '${{ github.event.inputs.from }}'"
             echo "has_release_notes=true" >> $GITHUB_OUTPUT
           else
@@ -223,24 +241,25 @@ jobs:
       #             is about to overwrite with S. Read afterwards, `S < L` compares S with
       #             itself and the guard never fires.
       #
-      # It also front-loads the "no release for this version" failure, so a promotion
-      # that cannot be recorded fails before anything reaches the CDN.
+      # It no longer front-loads a "no release for this version" failure: on signed -> qa
+      # there is deliberately no release yet. That check now lives in the release step,
+      # which knows the hop and can still create one; it stays fatal only for `latest`.
       # ---------------------------------------------------------------------------
       - name: Resolve version, tag and previous full release
         id: version
-        if: env.SE_PROMOTE == 'true' || env.SE_ROLLBACK == 'true' || (env.SE_LINEAR_BETA == 'true' && env.SE_HAS_LINEAR == 'true')
+        if: env.SE_RELEASE_HOP == 'true' || env.SE_ROLLBACK == 'true'
         uses: ./.github/actions/se-release
         with:
           mode: resolve
           github-token: ${{ secrets.GITHUB_TOKEN }}
           manifest: ${{ github.workspace }}/obs-streamelements.manifest
-          platform: ${{ github.event.inputs.platform }}
+          platform: ${{ matrix.platform }}
           to: ${{ github.event.inputs.to }}
           is-rollback: ${{ github.event.inputs.is-rollback }}
           output-dir: ${{ github.workspace }}/.release-input
 
       - name: Build changelog
-        if: env.SE_PROMOTE == 'true'
+        if: env.SE_RELEASE_HOP == 'true'
         uses: ./.github/actions/se-release
         with:
           mode: changelog
@@ -251,13 +270,13 @@ jobs:
 
       - name: Upload Manifests to CDN Google Storage
         if: ${{ github.event.inputs.dry-run == 'false' }}
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
           path: ${{ github.workspace }}
           glob: 'obs-streamelements.manifest'
-          destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/${{ github.event.inputs.platform }}/${{ github.event.inputs.to }}'
+          destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/${{ matrix.platform }}/${{ github.event.inputs.to }}'
           headers: |
             content-type: text/plain; charset=utf-8
             cache-control: 'public, max-age=60'
@@ -273,13 +292,13 @@ jobs:
       # has moved on.
       - name: Upload release notes to CDN Google Storage
         if: ${{ github.event.inputs.dry-run == 'false' }}
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
           path: ${{ github.workspace }}
           glob: 'obs-streamelements.release_notes.md'
-          destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/${{ github.event.inputs.platform }}/${{ github.event.inputs.to }}'
+          destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/${{ matrix.platform }}/${{ github.event.inputs.to }}'
           headers: |
             content-type: text/markdown; charset=utf-8
             cache-control: 'public, max-age=60'
@@ -289,21 +308,34 @@ jobs:
       # the upload action.
       - name: Upload SVGs to CDN Google Storage
         if: ${{ github.event.inputs.dry-run == 'false' && steps.download.outputs.has_version_svg == 'true' }}
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
           path: ${{ github.workspace }}
           glob: '{obs-streamelements.version.svg,obs-streamelements.*.version.svg}'
-          destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/${{ github.event.inputs.platform }}/${{ github.event.inputs.to }}'
+          destination: 'cdn.streamelements.com/obs/dist/obs-streamelements/${{ matrix.platform }}/${{ github.event.inputs.to }}'
           headers: |
             cache-control: 'no-store, no-cache, must-revalidate'
 
-      - name: Publish GitHub release
-        if: env.SE_PROMOTE == 'true'
+      # The GitHub release follows the channel, not the build. build.yml creates none:
+      #
+      #   signed -> qa      created as a prerelease titled '[ALPHA] <tag>'
+      #   qa -> beta        relabelled '[BETA] <tag>', still a prerelease
+      #   beta -> latest    titled '<tag>', full release, Latest
+      #
+      # Convergent at every hop, which matters because each version is promoted twice --
+      # once per platform. The second pass finds the release already in the right state
+      # and only re-asserts its title.
+      - name: Write the GitHub release for this channel
+        if: env.SE_RELEASE_HOP == 'true'
         uses: ./.github/actions/se-release
         with:
-          mode: publish
+          mode: release
+          to: ${{ github.event.inputs.to }}
+          # Also makes the step write release-body.md here, which the Linear release
+          # below reuses so both descriptions are the same bytes.
+          output-dir: ${{ github.workspace }}/.release-input
           github-token: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ steps.version.outputs.version_string }}
           previous-tag: ${{ steps.version.outputs.previous_tag }}
@@ -319,6 +351,30 @@ jobs:
           changelog-file: ${{ github.workspace }}/.release-input/changelog.md
           dry-run: ${{ github.event.inputs.dry-run }}
 
+      # Attach the signed installers, on the hop that creates the release. Moved here
+      # from build.yml with the release itself.
+      #
+      # Read from signed/ rather than from the destination channel, because that is
+      # where the installers this version was built as actually live. The channel is a
+      # moving pointer, so attach-assets.sh refuses to attach when signed/ has since
+      # moved on to a newer build -- shipping someone else's binaries under this tag
+      # would be worse than shipping none.
+      #
+      # Only on the qa hop: later promotions would find signed/ further ahead and skip
+      # anyway, and the assets are already on the release by then.
+      #
+      # Best-effort: a failure here leaves the release valid, just without binaries.
+      - name: Attach installers to the release
+        if: env.SE_RELEASE_HOP == 'true' && github.event.inputs.to == 'qa'
+        continue-on-error: true
+        uses: ./.github/actions/se-release
+        with:
+          mode: assets
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ steps.version.outputs.version_string }}
+          version-encoded: ${{ steps.version.outputs.version_encoded }}
+          dry-run: ${{ github.event.inputs.dry-run }}
+
       - name: Revert displaced GitHub release
         if: env.SE_ROLLBACK == 'true'
         uses: ./.github/actions/se-release
@@ -331,28 +387,34 @@ jobs:
           dry-run: ${{ github.event.inputs.dry-run }}
 
       # ---------------------------------------------------------------------------
-      # Linear release tracking. Two hops matter, mirroring how the channels are used:
+      # Linear release tracking. The Linear release now follows the channel exactly as
+      # the GitHub release does, one stage per hop:
       #
-      #   qa -> beta      the build becomes announceable: create the Linear release for
-      #                   this version and attach every issue resolved since the build
-      #                   beta served until a moment ago
-      #   beta -> latest  the build reaches everyone: complete that release
+      #   signed -> qa      create the release, named for the version, with the same
+      #                     body as the GitHub release, at stage "Alpha"
+      #   qa -> beta        stage -> "Open Beta"          (vars.LINEAR_BETA_STAGE)
+      #   beta -> latest    complete it, which is what moves a scheduled pipeline to its
+      #                     completed stage, "Released"
       #
-      # All of it runs after the CDN uploads and after the GitHub release, and every step
-      # is continue-on-error. Issue bookkeeping must never be able to hold up a promotion,
-      # least of all during an incident.
+      # and on the two rollbacks:
       #
-      # Issue detection is the part to watch. Linear keys do not appear in this repo's
-      # commit subjects -- master is squash-merged, so subjects read `feat(ci): ... (#93)`
-      # and the branch name that carried the key is gone. The CLI bridges that by
-      # resolving the `(#93)` reference to its pull request and reading the issues Linear
-      # linked to it, which works only for PRs whose branch carried a key. Coverage is
-      # therefore a branch-naming question; issue_pattern is additive and catches keys
-      # written into the subject by hand.
+      #   stable -> latest  the DISPLACED release goes back to "Open Beta"; the restored
+      #                     one is completed, mirroring what the GitHub rollback does
+      #   latest -> beta    stage -> "Alpha"
+      #
+      # Everything is continue-on-error. Issue bookkeeping must never hold up a
+      # promotion, least of all during an incident.
+      #
+      # Issue detection moved to the qa hop with creation. Linear keys do not appear in
+      # this repo's commit subjects -- master is squash-merged, so subjects read
+      # `feat(ci): ... (#93)` and the branch name that carried the key is gone. The CLI
+      # bridges that by resolving the `(#93)` reference to its pull request and reading
+      # the issues Linear linked to it, which works only for PRs whose branch carried a
+      # key. issue_pattern is additive and catches keys written into a subject by hand.
       # ---------------------------------------------------------------------------
       - name: Check out the promoted build
         id: linear_checkout
-        if: env.SE_HAS_LINEAR == 'true' && env.SE_LINEAR_BETA == 'true'
+        if: env.SE_HAS_LINEAR == 'true' && (env.SE_RELEASE_HOP == 'true' || env.SE_ROLLBACK == 'true')
         continue-on-error: true
         env:
           TAG: ${{ steps.version.outputs.version_string }}
@@ -368,26 +430,30 @@ jobs:
             echo "ok=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Sync Linear release
+      # Only `sync` creates a release or sets its version; `update` and `complete`
+      # strictly look one up and fail if it is absent. So this must run on the hop that
+      # creates -- signed -> qa -- and it is also the only hop that scans commits.
+      - name: Create the Linear release
         id: linear_sync
-        if: env.SE_HAS_LINEAR == 'true' && env.SE_LINEAR_BETA == 'true' && steps.linear_checkout.outputs.ok == 'true'
+        if: env.SE_HAS_LINEAR == 'true' && env.SE_RELEASE_HOP == 'true' && github.event.inputs.to == 'qa' && steps.linear_checkout.outputs.ok == 'true'
         continue-on-error: true
-        uses: linear/linear-release-action@v0
+        uses: linear/linear-release-action@17b8c24f8ceb2b98cabaf1965ff83c55dd596fac # v0
         with:
           access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
           command: sync
-          # Only `sync` sets a version on a release; `update` and `complete` select an
-          # existing one. Passing it explicitly at every hop is what lets the beta and
-          # latest promotions of the same build agree on which release they mean.
+          # Version and name are both the dotted build version. Passing the version
+          # explicitly at every hop is what lets the later ones select this release.
           version: ${{ steps.version.outputs.version_string }}
-          name: SE.Live ${{ steps.version.outputs.version_string }}
-          # Empty when the previous beta version is unknown or untagged, in which case the
-          # CLI falls back to its own scan base.
-          base_ref: ${{ steps.version.outputs.previous_channel_tag }}
-          # The blurb and notes composed at build time, which have travelled with the
-          # manifest through every channel. Skipped when the source channel only had the
-          # "no release notes" placeholder -- there is no point copying that into Linear.
-          release_notes: ${{ steps.download.outputs.has_release_notes == 'true' && format('{0}/obs-streamelements.release_notes.md', github.workspace) || '' }}
+          name: ${{ steps.version.outputs.version_string }}
+          # Byte-identical to the GitHub release body: the release step above writes the
+          # body it published to this path, so the two cannot drift.
+          release_notes: ${{ github.workspace }}/.release-input/release-body.md
+          # The last full release, so the issue scan covers exactly the range the
+          # changelog in the body above covers -- resolve.sh derives this from the same
+          # PREV_TAG, and falls back to the previous version on this channel only while
+          # no full release exists yet. Empty when neither resolves, in which case the
+          # CLI falls back to its own scan base and sees only the head commit.
+          base_ref: ${{ steps.version.outputs.linear_base_tag }}
           links: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.version.outputs.version_string }}
           # Additive to the CLI's built-in detection, and scoped to the team prefix so it
           # contributes nothing but CORE keys. It does not suppress the built-in subject
@@ -395,18 +461,43 @@ jobs:
           # named UTF-8, matched out of `fix: UTF-8 output into manifests`. That is
           # cosmetic -- identifiers absent from the workspace are ignored server-side --
           # and it is not something this input can turn off.
+          #
+          # This input is SUBJECT-ONLY, and so is --include-subjects. Keys in a commit
+          # body -- which is where this repo's `Fixes CORE-123` trailers live, master
+          # being squash-merged -- are picked up by the CLI's built-in magic-word
+          # detection instead, which reads the whole commit message. So description
+          # scanning is already covered; what it needed was a scan range wide enough to
+          # hold the descriptions, which base_ref above now supplies.
           issue_pattern: ${{ vars.LINEAR_ISSUE_PATTERN || '\b(CORE-[0-9]+)\b' }}
           dry_run: ${{ env.SE_LINEAR_DRY_RUN }}
           log_level: verbose
 
-      # The SE.Live pipeline currently has only Planned / In Progress / Released, so there
-      # is no stage that means "on the beta channel" and this step stays dormant. Add one
-      # in Linear and set the LINEAR_BETA_STAGE repository variable to its name to switch
-      # it on; nothing here needs to change.
-      - name: Move Linear release to the beta stage
-        if: env.SE_HAS_LINEAR == 'true' && env.SE_LINEAR_BETA == 'true' && vars.LINEAR_BETA_STAGE != '' && steps.linear_sync.outcome == 'success'
+      # A newly synced release sits in the pipeline's planned stage, so qa has to move it
+      # to the alpha stage explicitly.
+      #
+      # Matched by name, so a rename in Linear breaks it silently -- this stage was called
+      # "In Progress" until 2026-08-21. Its id (aa91d821-7539-4c19-865a-4c5bd91851f2) did
+      # not change and would have been immune; the name is used because it is legible in a
+      # workflow log and in the variable, and LINEAR_ALPHA_STAGE can override it without a
+      # code change if it moves again.
+      - name: Move the Linear release to the alpha stage
+        if: env.SE_HAS_LINEAR == 'true' && env.SE_RELEASE_HOP == 'true' && github.event.inputs.to == 'qa' && steps.linear_sync.outcome == 'success'
         continue-on-error: true
-        uses: linear/linear-release-action@v0
+        uses: linear/linear-release-action@17b8c24f8ceb2b98cabaf1965ff83c55dd596fac # v0
+        with:
+          access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
+          command: update
+          version: ${{ steps.version.outputs.version_string }}
+          stage: ${{ vars.LINEAR_ALPHA_STAGE || 'Alpha' }}
+          dry_run: ${{ env.SE_LINEAR_DRY_RUN }}
+          log_level: verbose
+
+      # Skipped when LINEAR_BETA_STAGE is unset, so a workspace without that stage keeps
+      # the release on the alpha stage rather than failing the promotion.
+      - name: Move the Linear release to the beta stage
+        if: env.SE_HAS_LINEAR == 'true' && env.SE_RELEASE_HOP == 'true' && github.event.inputs.to == 'beta' && vars.LINEAR_BETA_STAGE != ''
+        continue-on-error: true
+        uses: linear/linear-release-action@17b8c24f8ceb2b98cabaf1965ff83c55dd596fac # v0
         with:
           access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
           command: update
@@ -415,13 +506,72 @@ jobs:
           dry_run: ${{ env.SE_LINEAR_DRY_RUN }}
           log_level: verbose
 
-      # Reaching `latest` on either platform is what makes a build everyone's, so this
-      # mirrors requirement 1: the first platform through completes the release and the
-      # second one is a no-op on an already-completed release.
-      - name: Complete Linear release
-        if: env.SE_HAS_LINEAR == 'true' && env.SE_PROMOTE == 'true'
+      # Take over the issues held by the releases this one overtook, before they are
+      # cancelled below (CORE-954).
+      #
+      # A build reaches `latest` while older builds are still sitting on Alpha or Open
+      # Beta. Their work shipped -- they are ancestors of this tag -- but the cancel
+      # sweep at the end of this job retires them, and without this step their issues go
+      # quiet with them: the release that actually delivered the work does not list it,
+      # and the release that lists it is Canceled.
+      #
+      # This is a second `sync` on the release that is shipping, and the only thing that
+      # makes it different from the one at signed -> qa is the scan range: base_ref is
+      # the previous FULL release, so the range covers every overtaken build in between
+      # rather than just this build's own commits.
+      #
+      # Deriving the set from commits rather than reading it off the old releases is not
+      # a shortcut, it is the only option. LINEAR_ACCESS_KEY is pipeline-scoped, and the
+      # five operations it can perform (releaseSyncByAccessKey,
+      # releaseUpdateByPipelineByAccessKey, releaseCompleteByAccessKey,
+      # pipelineSettingsByAccessKey, recentReleasesByAccessKey) include no way to list a
+      # release's issues -- recentReleasesByAccessKey returns id, name, createdAt and
+      # commitSha and nothing else. A workspace-scoped key in Actions was rejected on
+      # security grounds, so reading them is not available here at any price.
+      #
+      # Adding is safe because an issue may belong to more than one release in a
+      # pipeline: verified against the live workspace by attaching a second release to an
+      # issue that already had one and reading it back on both, then reverting. So this
+      # cannot take an issue away from a release that is still open, and it cannot fail
+      # on an issue another release already holds.
+      #
+      # The flip side is that the cancelled releases keep listing their issues too --
+      # there is no detach operation on this key. The release that shipped the work gains
+      # it, which is the traceability that was missing; a true move needs the Linear MCP.
+      #
+      # Runs BEFORE `complete`, so the release is already holding everything when
+      # completion fires the pipeline's autoGenerateReleaseNotesOnCompletion and
+      # rolloverIssuesOnCompletion settings.
+      - name: Adopt the issues of the releases this one overtook
+        id: linear_adopt
+        if: env.SE_HAS_LINEAR == 'true' && env.SE_PROMOTE == 'true' && steps.linear_checkout.outputs.ok == 'true' && steps.version.outputs.linear_base_tag != ''
         continue-on-error: true
-        uses: linear/linear-release-action@v0
+        uses: linear/linear-release-action@17b8c24f8ceb2b98cabaf1965ff83c55dd596fac # v0
+        with:
+          access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
+          command: sync
+          version: ${{ steps.version.outputs.version_string }}
+          name: ${{ steps.version.outputs.version_string }}
+          # The whole point of this step. Deliberately NOT the previous build: the range
+          # has to reach back past every release that was overtaken.
+          base_ref: ${{ steps.version.outputs.linear_base_tag }}
+          issue_pattern: ${{ vars.LINEAR_ISSUE_PATTERN || '\b(CORE-[0-9]+)\b' }}
+          # Release notes are deliberately not passed. They were written by the
+          # signed -> qa sync and again into the GitHub release body above; this step
+          # exists to add issues, and re-sending them here would be a second source of
+          # truth for the same text.
+          dry_run: ${{ env.SE_LINEAR_DRY_RUN }}
+          log_level: verbose
+
+      # `complete` rather than `update --stage=Released`: for a scheduled pipeline that
+      # is what moves a release into the completed stage, and it is the only path that
+      # fires the pipeline's autoGenerateReleaseNotesOnCompletion and
+      # rolloverIssuesOnCompletion settings, both of which are on.
+      - name: Complete the Linear release
+        id: linear_complete
+        if: env.SE_HAS_LINEAR == 'true' && (env.SE_PROMOTE == 'true' || env.SE_ROLLBACK == 'true')
+        continue-on-error: true
+        uses: linear/linear-release-action@17b8c24f8ceb2b98cabaf1965ff83c55dd596fac # v0
         with:
           access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
           command: complete
@@ -429,9 +579,126 @@ jobs:
           dry_run: ${{ env.SE_LINEAR_DRY_RUN }}
           log_level: verbose
 
+      # A stable -> latest rollback puts an older build back in front of users, so the
+      # release it displaces stops being released. It goes back to the beta stage rather
+      # than to alpha: it was on beta before it was promoted, and should_revert is
+      # already false whenever the other platform still serves it.
+      - name: Move the displaced Linear release back to the beta stage
+        if: env.SE_HAS_LINEAR == 'true' && env.SE_ROLLBACK == 'true' && steps.version.outputs.should_revert == 'true' && steps.version.outputs.displaced_tag != '' && vars.LINEAR_BETA_STAGE != ''
+        continue-on-error: true
+        uses: linear/linear-release-action@17b8c24f8ceb2b98cabaf1965ff83c55dd596fac # v0
+        with:
+          access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
+          command: update
+          version: ${{ steps.version.outputs.displaced_tag }}
+          stage: ${{ vars.LINEAR_BETA_STAGE }}
+          dry_run: ${{ env.SE_LINEAR_DRY_RUN }}
+          log_level: verbose
+
+      # latest -> beta is only ever reached as a rollback -- "Validate Input" rejects it
+      # as a promotion. The build is being taken away from everyone, so its release goes
+      # back to the alpha stage rather than to the beta stage.
+      - name: Move the Linear release back to the alpha stage
+        if: env.SE_HAS_LINEAR == 'true' && github.event.inputs.is-rollback == 'true' && github.event.inputs.from == 'latest' && github.event.inputs.to == 'beta'
+        continue-on-error: true
+        uses: linear/linear-release-action@17b8c24f8ceb2b98cabaf1965ff83c55dd596fac # v0
+        with:
+          access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
+          command: update
+          version: ${{ steps.version.outputs.version_string }}
+          stage: ${{ vars.LINEAR_ALPHA_STAGE || 'Alpha' }}
+          dry_run: ${{ env.SE_LINEAR_DRY_RUN }}
+          log_level: verbose
+
+      # Cancel whatever is still open behind the release that just shipped.
+      #
+      # A build can reach `latest` while older builds are still sitting on Alpha or
+      # Open Beta -- they were promoted to qa or beta and then overtaken. Those releases
+      # will never ship, and leaving them open makes the pipeline read as though several
+      # versions are in flight at once.
+      #
+      # This is a script rather than more `uses:` steps because the set is dynamic and an
+      # action step cannot loop. The CLI has no list command either, so the candidates are
+      # derived from tags instead: every version tag strictly between the previous full
+      # release and this one. Anything older than the previous full release was already
+      # completed or cancelled when that one shipped, so the window is exactly right.
+      #
+      # `update` errors on a version with no release, which is the common case here --
+      # most tagged builds are never promoted. Those failures are expected and swallowed
+      # per version; only the count is reported.
+      - name: Cancel releases left open behind this one
+        # Gated on the adoption above as well as on completion. Cancelling a release
+        # whose issues were not taken over is the exact failure this pair exists to
+        # prevent -- better to leave it open and visible than to retire it quietly with
+        # work still attached to nothing that shipped.
+        if: env.SE_HAS_LINEAR == 'true' && env.SE_PROMOTE == 'true' && steps.linear_complete.outcome == 'success' && steps.linear_adopt.outcome == 'success'
+        continue-on-error: true
+        env:
+          LINEAR_ACCESS_KEY: ${{ secrets.LINEAR_ACCESS_KEY }}
+          TAG: ${{ steps.version.outputs.version_string }}
+          PREV: ${{ steps.version.outputs.previous_tag }}
+          CANCEL_STAGE: ${{ vars.LINEAR_CANCELED_STAGE || 'Canceled' }}
+          DRY: ${{ env.SE_LINEAR_DRY_RUN }}
+          # Pinned to the version linear-release-action installs by default, so both
+          # paths speak to Linear through the same CLI.
+          CLI_VERSION: v0.15.0
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PREV" ]; then
+            echo "::warning::no previous full release, so the range of possibly-open releases is unbounded; skipping the cancel sweep"
+            exit 0
+          fi
+
+          # The build number is the last dotted component and is a global monotonic
+          # counter, which makes it a truer order than the yy.m.d prefix -- that has at
+          # least one bogus entry (tag 15.12.15.535 sorts wrong by date but right by
+          # build number).
+          build_of() { printf '%s\n' "${1##*.}"; }
+          cur=$(build_of "$TAG")
+          low=$(build_of "$PREV")
+          echo "::notice::cancel sweep: releases with build numbers strictly between $low ($PREV) and $cur ($TAG)"
+
+          curl -fsSL "https://github.com/linear/linear-release/releases/download/$CLI_VERSION/linear-release-linux-x64" -o linear-release
+          chmod +x linear-release
+
+          cancelled=0
+          absent=0
+          for t in $(git tag --list '[0-9]*.[0-9]*.[0-9]*.[0-9]*' | sort -t. -k4,4n); do
+            b=$(build_of "$t")
+            case "$b" in '' | *[!0-9]*) continue ;; esac
+            [ "$b" -gt "$low" ] || continue
+            [ "$b" -lt "$cur" ] || continue
+
+            args="update --stage=$CANCEL_STAGE --release-version=$t --quiet"
+            [ "$DRY" = 'true' ] && args="$args --dry-run"
+            # shellcheck disable=SC2086
+            if ./linear-release $args > /dev/null 2>&1; then
+              echo "  cancelled $t"
+              cancelled=$((cancelled + 1))
+            else
+              absent=$((absent + 1))
+            fi
+          done
+
+          rm -f linear-release
+          echo "::notice::cancel sweep: $cancelled release(s) moved to '$CANCEL_STAGE', $absent tag(s) had no release (dry-run: $DRY)"
+      # Runs BEFORE the upload, and the order is load-bearing.
+      #
+      # Monitor storage is a hard quota (1 GiB for this group). When it is full,
+      # VirusTotal rejects an upload with HTTP 429 QuotaExceededError -- the same status
+      # it uses for rate limits, so the action retries it five times and fails. With the
+      # prune ordered after the upload, a failed upload skipped the one step that frees
+      # space, so a full store stayed full and every later promotion failed identically.
+      # That is exactly what happened on the first real signed -> qa run: 1020264912 of
+      # 1048576000 bytes used, 27 MiB free, a 35.76 MiB installer to store.
+      #
+      # Pruning first cannot delete what is being promoted: the manifests below were
+      # uploaded earlier in this job, so the incoming version is already live on the
+      # destination channel and protected by manifest-urls.
       - name: Prune old versions from VirusTotal Monitor
-        uses: streamelements/virustotal-monitor-action@v1
-        if: ${{ github.event.inputs.dry-run == 'false' && github.event.inputs.platform == 'windows' }}
+        uses: StreamElements/virustotal-monitor-action@v1
+        if: ${{ github.event.inputs.dry-run == 'false' && matrix.platform == 'windows' }}
         with:
           # The action has no default and reads no environment variable — the key is always
           # passed in. Point this at whatever your repo or org calls the secret.
@@ -439,9 +706,31 @@ jobs:
           mode: prune
           managed-prefixes: /obs-streamelements-core
           quota-bytes: ${{ vars.VT_MONITOR_QUOTA_BYTES || '1GiB' }}
-          high-watermark: ${{ inputs.high-watermark || vars.VT_MONITOR_HIGH_WATERMARK || '80' }}
-          target-watermark: ${{ inputs.target-watermark || vars.VT_MONITOR_TARGET_WATERMARK || '60' }}
-          keep-versions: ${{ vars.VT_MONITOR_KEEP_VERSIONS || '3' }}
+          # Retention is the manifests and nothing else: what the five channels point at
+          # stays, everything else under the prefix goes, on every promotion.
+          #
+          # The watermarks used to gate this at 80% and prune back to 60%, which meant that
+          # in practice we never pruned -- and then the store filled. VirusTotal answers a
+          # full store with the same HTTP 429 it uses for rate limits, so the first real
+          # signed -> qa upload retried five times and failed at 1020264912 of 1048576000
+          # bytes used.
+          #
+          # 0 would say this plainly, but the action rejects it: parseWatermark requires a
+          # positive number and target-watermark must be strictly below high-watermark. So
+          # 0.01 is 'as soon as there is anything worth pruning' and 0.001 is 'prune it
+          # all', with the manifests doing the actual keeping. Note these are fractions,
+          # not the percentages the old 80/60 were: parseWatermark reads a value above 1
+          # as a percentage and anything else as a fraction, so '1' would mean 100% and
+          # prune only once the store is completely full -- the opposite of the intent.
+          #
+          # Worth replacing with a first-class retention option in the action rather than
+          # leaving two watermarks standing in for a policy that has nothing to do with
+          # usage.
+          high-watermark: ${{ vars.VT_MONITOR_HIGH_WATERMARK || '0.01' }}
+          target-watermark: ${{ vars.VT_MONITOR_TARGET_WATERMARK || '0.001' }}
+          # No newest-N protection: an unpromoted build is exactly what should be deleted,
+          # and being recent is not a reason to keep it.
+          keep-versions: ${{ vars.VT_MONITOR_KEEP_VERSIONS || '0' }}
           # Anything these point at is never deleted. If any of them cannot be fetched, the
           # step fails rather than pruning with an incomplete picture of what is live.
           #
@@ -466,3 +755,86 @@ jobs:
           # Storage housekeeping must never take a release down with it.
           on-error: warn
           verbose: true
+
+      # Submitting the signed installers to VirusTotal Monitor, moved here from
+      # build.yml's deploy-signed-windows job.
+      #
+      # Uploading at build time submitted every master build, including ones never
+      # promoted to a channel any user sees. Doing it on promotion means the binaries AV
+      # vendors are shown are the ones actually being shipped, and it puts the upload in
+      # the same job as the prune instead of adding in one workflow and reconciling in
+      # another. The prune runs first; see the ordering note on it above.
+      #
+      # Both the version key and the two installer URLs are read out of the manifest
+      # downloaded above rather than reconstructed. The channels disagree about installer
+      # filenames -- signed/ uses -<version>.exe and -<version>-64bit.exe, qa/beta/latest
+      # use -x86-/-x64-, stable drops the version entirely -- but every manifest carries
+      # package_url, package_url_64 and version_number. version_number is also what the
+      # prune matches on, so the keys stay consistent with everything build.yml submitted
+      # before this moved.
+      #
+      # Only on signed -> qa, the first hop a build takes and the point it stops being
+      # purely internal. Every later promotion moves the same bytes, so firing on any
+      # non-dry-run Windows promotion would submit one release four times over and spend
+      # the rate limits documented on the prune above for nothing. is-rollback needs no
+      # mention: "Validate Input" above rejects `to == signed` outright and allows no
+      # transition out of `signed` other than to `qa`, so this pair is only ever a
+      # forward promotion.
+      #
+      # The prune above deliberately keeps the wider gate: housekeeping should run on
+      # every promotion regardless of whether this hop submitted anything.
+      - name: Download signed installers for VirusTotal
+        id: vt_installers
+        if: ${{ github.event.inputs.dry-run == 'false' && matrix.platform == 'windows'
+          && github.event.inputs.from == 'signed' && github.event.inputs.to == 'qa' }}
+        run: |
+          set -euo pipefail
+
+          # The manifest is CRLF, so every value is stripped before use; a trailing
+          # carriage return silently corrupts both the URLs and the version key.
+          read_field() {
+            sed -n "s/^$1=//p" obs-streamelements.manifest | tr -d '\r' | head -1
+          }
+
+          version_number="$(read_field version_number)"
+          url_32="$(read_field package_url)"
+          url_64="$(read_field package_url_64)"
+
+          if [ -z "$version_number" ] || [ -z "$url_32" ] || [ -z "$url_64" ]; then
+            echo "::error::manifest on '${{ github.event.inputs.from }}' is missing version_number, package_url or package_url_64; cannot submit to VirusTotal"
+            exit 1
+          fi
+
+          # Keep the CDN's filenames: they are what shows up in VirusTotal Monitor, and
+          # renaming them would make a promoted build look unrelated to what build.yml
+          # used to submit. The query string is a cache-buster and is dropped.
+          name_32="$(basename "${url_32%%\?*}")"
+          name_64="$(basename "${url_64%%\?*}")"
+
+          curl -fsS --output "$name_32" "$url_32"
+          curl -fsS --output "$name_64" "$url_64"
+
+          echo "version_number=$version_number" >> "$GITHUB_OUTPUT"
+          echo "file_32=$name_32" >> "$GITHUB_OUTPUT"
+          echo "file_64=$name_64" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::submitting $name_32 and $name_64 (version $version_number) to VirusTotal Monitor"
+
+      - name: Upload signed installers to VirusTotal Monitor
+        if: ${{ github.event.inputs.dry-run == 'false' && matrix.platform == 'windows'
+          && github.event.inputs.from == 'signed' && github.event.inputs.to == 'qa' }}
+        uses: StreamElements/virustotal-monitor-action@v1
+        with:
+          # The action has no default and reads no environment variable — the key is always
+          # passed in. Point this at whatever your repo or org calls the secret.
+          api-key: ${{ secrets.VT_MONITOR_API_KEY }}
+          mode: upload
+          version: ${{ steps.vt_installers.outputs.version_number }}
+          path-prefix: /obs-streamelements-core/windows
+          files: |
+            ${{ github.workspace }}/${{ steps.vt_installers.outputs.file_32 }}
+            ${{ github.workspace }}/${{ steps.vt_installers.outputs.file_64 }}
+          # Upload failures are loud: a release AV vendors never see is the problem this solves.
+          on-error: fail
+          verbose: true
+

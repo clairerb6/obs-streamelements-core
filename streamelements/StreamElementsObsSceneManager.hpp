@@ -217,12 +217,19 @@ public:
 		: m_obsSceneManager(obsSceneManager),
 		  m_videoCompositionBase(videoCompositionBase)
 	{
+		// Cached now, while the composition is provably alive. Every later
+		// reader wants the id and nothing else, so caching it means the
+		// composition pointer never has to be dereferenced again -- which
+		// is what makes it safe for the composition to die first.
+		m_videoCompositionId = videoCompositionBase
+					       ? videoCompositionBase->GetId()
+					       : std::string();
+
 		m_asyncTaskQueue = std::make_shared<StreamElementsAsyncTaskQueue>(
 			(std::string(
 				 "SESignalHandlerData for video composition ") +
-			 std::string(videoCompositionBase
-					     ? videoCompositionBase->GetId()
-					     : "unknown"))
+			 (m_videoCompositionId.size() ? m_videoCompositionId
+						      : std::string("unknown")))
 				.c_str());
 
 		AddRef();
@@ -274,7 +281,13 @@ private:
 
 		// std::unique_lock lock(m_scenes_mutex);
 
-		m_videoCompositionBase = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(
+				m_videoCompositionMutex);
+
+			m_videoCompositionBase = nullptr;
+		}
+
 		m_obsSceneManager = nullptr;
 
 		for (auto kv : m_scenes) {
@@ -283,6 +296,7 @@ private:
 
 		m_scenes.clear();
 		m_scenes_refcount.clear();
+		m_groups_refcount.clear();
 
 		if (m_scene) {
 			obs_scene_release(SETRACE_DECREF(m_scene));
@@ -320,9 +334,13 @@ public:
 		}
 		
 		if (shouldDelete) {
+			// The cached id, not m_videoCompositionBase->GetId():
+			// this runs on the teardown path, which is exactly when
+			// the composition is most likely to be gone already.
 			blog(LOG_INFO,
-			     "[obs-streamelements-core]: released SESignalHandlerData for video composition '%s'", m_videoCompositionBase->GetId().c_str());
-			
+			     "[obs-streamelements-core]: released SESignalHandlerData for video composition '%s'",
+			     m_videoCompositionId.c_str());
+
 			delete this;
 		}
 	}
@@ -332,7 +350,7 @@ public:
 		SESignalHandlerData *self = this;
 
 		while (self->m_parent)
-			self = m_parent;
+			self = self->m_parent;
 
 		std::shared_lock lock(self->m_scenes_mutex);
 		for (auto kv : self->m_scenes)
@@ -358,16 +376,44 @@ public:
 		return m_scenes[scene];
 	}
 
-	SESignalHandlerData* AddSceneRef(obs_scene_t* scene) {
+	SESignalHandlerData *AddSceneRef(obs_scene_t *scene)
+	{
+		obs_scene_t *group = nullptr;
+
 		if (obs_scene_is_group(scene) && m_scene) {
 			// If it's a group, use OUR scene (root scene) instead
+			group = scene;
 			scene = m_scene;
 		}
 
-		if (m_parent) {
-			return m_parent->AddSceneRef(scene);
+		return GetRoot()->AddSceneRefAtRoot(scene, group);
+	}
+
+	void RemoveSceneRef(obs_scene_t *scene)
+	{
+		obs_scene_t *group = nullptr;
+
+		if (obs_scene_is_group(scene) && m_scene) {
+			// If it's a group, use OUR scene (root scene) instead
+			group = scene;
+			scene = m_scene;
 		}
 
+		GetRoot()->RemoveSceneRefAtRoot(scene, group);
+	}
+
+	// The handler data that owns the scene map, the task queue and the
+	// Lock()/Unlock() count. It drains its queue before it is destroyed, so
+	// unlike a per-scene child it is safe for queued work to hold.
+	SESignalHandlerData *GetRoot()
+	{
+		return m_parent ? m_parent->GetRoot() : this;
+	}
+
+private:
+	SESignalHandlerData *AddSceneRefAtRoot(obs_scene_t *scene,
+					       obs_scene_t *group)
+	{
 		std::unique_lock lock(m_scenes_mutex);
 
 		if (!m_scenes.count(scene)) {
@@ -383,38 +429,63 @@ public:
 			++m_scenes_refcount[scene];
 		}
 
+		// A group is counted against its parent scene. Remember which
+		// group added that count, so that only its own removal can take
+		// it back -- see RemoveSceneRefAtRoot().
+		if (group)
+			++m_groups_refcount[group];
+
 		return m_scenes[scene];
 	}
 
-	void RemoveSceneRef(obs_scene_t* scene) {
-		if (obs_scene_is_group(scene) && m_scene) {
-			// If it's a group, use OUR scene (root scene) instead
-			scene = m_scene;
-		}
+	void RemoveSceneRefAtRoot(obs_scene_t *scene, obs_scene_t *group)
+	{
+		SESignalHandlerData *retired = nullptr;
 
-		if (m_parent) {
-			m_parent->RemoveSceneRef(scene);
+		{
+			std::unique_lock lock(m_scenes_mutex);
 
-			return;
-		}
+			if (group) {
+				// libobs announces the removal of a group but not
+				// always its creation: obs_scene_add_group() --
+				// which is how SE.Live creates groups -- emits no
+				// item_add, yet removing or ungrouping that group
+				// emits item_remove. Subtracting a count that was
+				// never added deleted the parent scene's handler
+				// data while every signal on that scene was still
+				// connected to it (CORE-1715).
+				auto it = m_groups_refcount.find(group);
 
-		std::unique_lock lock(m_scenes_mutex);
+				if (it == m_groups_refcount.end())
+					return;
 
-		if (!m_scenes.count(scene))
-			return;
+				if (--it->second == 0)
+					m_groups_refcount.erase(it);
+			}
 
-		--m_scenes_refcount[scene];
+			if (!m_scenes.count(scene))
+				return;
 
-		if (m_scenes_refcount[scene] == 0) {
-			delete m_scenes[scene];
+			--m_scenes_refcount[scene];
+
+			if (m_scenes_refcount[scene] != 0)
+				return;
+
+			retired = m_scenes[scene];
 
 			m_scenes_refcount.erase(scene);
 			m_scenes.erase(scene);
-
-			Release();
 		}
+
+		// Both outside the lock. Release() can drop the last reference
+		// and delete this object, and the lock must not outlive the
+		// mutex it guards.
+		delete retired;
+
+		Release();
 	}
 
+public:
 	obs_scene_t* GetRootSceneRef()
 	{
 		std::shared_lock lock(m_scenes_mutex);
@@ -496,10 +567,57 @@ public:
 	}
 
 public:
+	//
+	// The id of the video composition these signals belong to, or an empty
+	// string once it has been detached.
+	//
+	// Readers want the id, never the object. Handing back the cached string
+	// keeps the composition pointer from escaping to the OBS signal
+	// callbacks that run on the graphics thread -- which is where it used
+	// to be dereferenced after the composition had been destroyed
+	// (CORE-1114).
+	//
+	std::string GetVideoCompositionId()
+	{
+		// Only the root is given the composition, so only the root caches
+		// its id -- but every OBS signal is connected with a per-scene
+		// child. Answering from the child returned "" for every scene-item
+		// event, which sent each one down a fallback that searches OBS's
+		// scene list off the UI thread (CORE-1715).
+		if (m_parent)
+			return m_parent->GetVideoCompositionId();
+
+		std::lock_guard<std::mutex> lock(m_videoCompositionMutex);
+
+		return m_videoCompositionBase ? m_videoCompositionId
+					      : std::string();
+	}
+
+	//
+	// Called by the video composition as it is destroyed.
+	//
+	// Release() alone is not enough: it only reaches ~SESignalHandlerData,
+	// and therefore Clear(), when the refcount happens to drop to zero. If
+	// anything else still holds a reference, the back-pointer survives the
+	// composition and the next signal dereferences freed memory.
+	//
+	void DetachVideoComposition()
+	{
+		// Drain queued work first, so nothing is still using the
+		// composition when we let go of it.
+		Wait();
+
+		std::lock_guard<std::mutex> lock(m_videoCompositionMutex);
+
+		m_videoCompositionBase = nullptr;
+	}
+
 	// char m_header[7] = "header"; // TODO: Remvoe debug marker
 	StreamElementsObsSceneManager *m_obsSceneManager = nullptr;
 	StreamElementsVideoCompositionBase *m_videoCompositionBase = nullptr;
 	obs_scene_t* m_scene = nullptr;
+	std::string m_videoCompositionId;
+	std::mutex m_videoCompositionMutex;
 	// char m_footer[7] = "footer"; // TODO: Remvoe debug marker
 
 private:
@@ -512,6 +630,8 @@ private:
 	std::shared_mutex m_scenes_mutex;
 	std::map<obs_scene_t *, SESignalHandlerData *> m_scenes;
 	std::map<obs_scene_t *, uint32_t> m_scenes_refcount;
+	// Groups whose add was counted against their parent scene, by group.
+	std::map<obs_scene_t *, uint32_t> m_groups_refcount;
 	SESignalHandlerData *m_parent = nullptr;
 
 	std::shared_mutex m_refcount_mutex;

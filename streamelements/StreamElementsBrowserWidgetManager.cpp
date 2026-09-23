@@ -21,12 +21,32 @@ StreamElementsBrowserWidgetManager::StreamElementsBrowserWidgetManager(
 
 StreamElementsBrowserWidgetManager::~StreamElementsBrowserWidgetManager()
 {
-	// Shutdown browser internals first so base dock teardown doesn't race
-	// with CEF/native resources during OBS exit.
+	// This runs before the base destructor deletes any dock, so on the OBS
+	// teardown path every entry here may already have been destroyed by Qt
+	// along with its dock. QPointer makes that visible (CORE-786).
+	//
+	// Closing each browser here, rather than leaving it to
+	// ~StreamElementsBrowserWidget, is deliberate and is the whole point of
+	// this loop (CORE-1060).
+	//
+	// QCefWidgetInternal::closeBrowser() runs a nested Qt event loop for up
+	// to a second: with CEF configured for an external message pump it is
+	// only driven by a Qt timer, so waiting for the browser to close means
+	// keeping Qt's loop turning. That loop delivers every other queued event
+	// too. Reached from the widget's destructor -- which is where the base
+	// class ends up, several frames inside ~QWidget and deleteChildren -- it
+	// hands control to unrelated code while our widget tree is half
+	// destroyed. A third-party plugin enumerating docks at that moment
+	// dereferenced a child that was already gone.
+	//
+	// Called here the same loop runs against an intact widget tree, which is
+	// what makes it safe. DestroyBrowser() is idempotent, so the destructor's
+	// own call becomes a no-op.
 	for (auto kv : m_browserWidgets) {
-		if (kv.second) {
-			kv.second->DestroyBrowser();
-		}
+		if (!kv.second)
+			continue;
+
+		kv.second->DestroyBrowser();
 		kv.second->RemoveVideoCompositionView();
 	}
 
@@ -354,6 +374,10 @@ bool StreamElementsBrowserWidgetManager::SetWidgetUrlById(const char *const id,
 	if (!m_browserWidgets.count(id))
 		return false;
 
+	// Null when Qt destroyed the widget with its dock (CORE-786).
+	if (!m_browserWidgets[id])
+		return false;
+
 	m_browserWidgets[id]->BrowserLoadInitialPage(url);
 
 	return true;
@@ -374,7 +398,10 @@ bool StreamElementsBrowserWidgetManager::RemoveDockWidget(const char *const id)
 
 	if (StreamElementsWidgetManager::RemoveDockWidget(id)) {
 		if (m_browserWidgets.count(id)) {
-			m_browserWidgets[id]->RemoveVideoCompositionView();
+			if (m_browserWidgets[id])
+				m_browserWidgets[id]
+					->RemoveVideoCompositionView();
+
 			m_browserWidgets.erase(id);
 
 			return true;
@@ -402,6 +429,9 @@ StreamElementsBrowserWidgetManager::GetDockBrowserWidgetInfo(
 		return nullptr;
 
 	auto browser = m_browserWidgets[id];
+
+	if (!browser)
+		return nullptr;
 
 	StreamElementsBrowserWidgetManager::DockWidgetInfo *baseInfo =
 		GetDockWidgetInfo(id);
@@ -593,10 +623,10 @@ void StreamElementsBrowserWidgetManager::DeserializeDockingWidgets(
 						mainWindow()->splitDockWidget(prev, curr, Qt::Vertical);
 					}
 
-					QApplication::sendPostedEvents();
+					SEDrainEventQueue();
 					prev->setMinimumSize(idToMinSizeMap[dockIds[i - 1]]);
 					prev->widget()->setMinimumSize(idToMinSizeMap[dockIds[i - 1]]);
-					QApplication::sendPostedEvents();
+					SEDrainEventQueue();
 				}
 				*/
 			}
@@ -972,7 +1002,7 @@ bool StreamElementsBrowserWidgetManager::InsertDockingWidgetRelativeToId(
 		}
 	}
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	return true;
 }
@@ -1021,7 +1051,7 @@ void StreamElementsBrowserWidgetManager::HideNotificationBar()
 
 		m_notificationBarToolBar->setVisible(false);
 
-		QApplication::sendPostedEvents();
+		SEDrainEventQueue();
 
 		mainWindow()->removeToolBar(m_notificationBarToolBar);
 
@@ -1044,7 +1074,9 @@ void StreamElementsBrowserWidgetManager::SerializeNotificationBar(
 {
 	std::lock_guard<std::recursive_mutex> guard(m_mutex);
 
-	if (m_notificationBarToolBar) {
+	// Both, not just the toolbar: the browser widget is dereferenced below
+	// and can be destroyed independently of its container. See CORE-635.
+	if (m_notificationBarToolBar && m_notificationBarBrowserWidget) {
 		CefRefPtr<CefDictionaryValue> rootDictionary =
 			CefDictionaryValue::Create();
 		output->SetDictionary(rootDictionary);
@@ -1118,6 +1150,11 @@ void StreamElementsBrowserWidgetManager::DeserializeNotificationBar(
 	// Convert JSON string to CefValue
 	CefRefPtr<CefValue> root = CefParseJSON(
 		CefString(input), JSON_PARSER_ALLOW_TRAILING_COMMAS);
+
+	// Null for unparsable input, and the overload below dereferences it
+	// without checking. Same defect as CORE-1601, one call frame further on.
+	if (!root.get())
+		return;
 
 	DeserializeNotificationBar(root);
 }

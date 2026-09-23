@@ -3,6 +3,7 @@
 #include "StreamElementsUtils.hpp"
 #include "StreamElementsGlobalStateManager.hpp"
 #include "StreamElementsNetworkDialog.hpp"
+#include "StreamElementsSecretRedactor.hpp"
 #include "StreamElementsConfig.hpp"
 #include "Version.hpp"
 #include "ui_StreamElementsReportIssueDialog.h"
@@ -284,13 +285,40 @@ void StreamElementsReportIssueDialog::accept()
 
 				zip_entry_open(zip, wstring_to_utf8(zipPath).c_str());
 
-				int read = ::read(fd, buf, BUF_LEN);
-				while (read > 0) {
-					if (0 != zip_entry_write(zip, buf, read)) {
-						break;
+				// service.json carries the stream key in
+				// plaintext, so it is buffered whole and
+				// sanitized rather than streamed straight
+				// through to the upload.
+				if (StreamElementsSecretRedactor::IsSensitivePath(
+					    zipPath)) {
+					std::string content;
+
+					int read = ::read(fd, buf, BUF_LEN);
+					while (read > 0) {
+						content.append(
+							(const char *)buf,
+							(size_t)read);
+
+						read = ::read(fd, buf, BUF_LEN);
 					}
 
-					read = ::read(fd, buf, BUF_LEN);
+					const std::string sanitized =
+						StreamElementsSecretRedactor::
+							Redact(content);
+
+					zip_entry_write(zip, sanitized.c_str(),
+							sanitized.size());
+				} else {
+					int read = ::read(fd, buf, BUF_LEN);
+					while (read > 0) {
+						if (0 !=
+						    zip_entry_write(zip, buf,
+								    read)) {
+							break;
+						}
+
+						read = ::read(fd, buf, BUF_LEN);
+					}
 				}
 
 				zip_entry_close(zip);
@@ -358,30 +386,50 @@ void StreamElementsReportIssueDialog::accept()
 		std::map<std::wstring, std::wstring> local_to_zip_files_map;
 
 		if (collect_all) {
+			// Kept in step with the list in
+			// StreamElementsCrashContext.cpp, which collects the
+			// same tree for crash reports. Compared against the
+			// lowercased, forward-slashed relative path, so entries
+			// must be lowercase or they silently match nothing.
 			std::vector<std::wstring> blacklist = {
-                L"plugin_config/obs-streamelements/obs-streamelements-update.exe",
-                L"plugin_config/obs-streamelements/obs-streamelements-update.pkg",
-                L"plugin_config/obs-streamelements/obs-streamelements-update.dmg",
-				L"plugin_config/obs-browser/cache/",
-				L"plugin_config/obs-browser/blob_storage/",
-				L"plugin_config/obs-browser/code cache/",
-				L"plugin_config/obs-browser/gpucache/",
-				L"plugin_config/obs-browser/visited links/",
-				L"plugin_config/obs-browser/transportsecurity/",
-				L"plugin_config/obs-browser/videodecodestats/",
-				L"plugin_config/obs-browser/session storage/",
-				L"plugin_config/obs-browser/service worker/",
-				L"plugin_config/obs-browser/pepper data/",
-				L"plugin_config/obs-browser/indexeddb/",
-				L"plugin_config/obs-browser/file system/",
-				L"plugin_config/obs-browser/databases/",
-				L"plugin_config/obs-browser/obs-streamelements-core.ini.bak",
-				L"plugin_config/obs-browser/cef.",
-				L"plugin_config/obs-browser/obs_profile_cookies/",
+				// Both spellings, because both directories exist
+				// on a machine that has been through the
+				// rename: the ~17MB updater sits in
+				// obs-streamelements, and a second ~16MB copy
+				// in obs-streamelements-core. Only the first
+				// was ever listed.
+				L"plugin_config/obs-streamelements/obs-streamelements-update.exe",
+				L"plugin_config/obs-streamelements/obs-streamelements-update.pkg",
+				L"plugin_config/obs-streamelements/obs-streamelements-update.dmg",
+				L"plugin_config/obs-streamelements-core/obs-streamelements-update.exe",
+				L"plugin_config/obs-streamelements-core/obs-streamelements-update.pkg",
+				L"plugin_config/obs-streamelements-core/obs-streamelements-update.dmg",
+				// The Sentry SDK's own database, holding the
+				// minidumps of previous crashes. No trailing
+				// slash, so the same prefix covers the
+				// timestamped copies left by a manual reset.
+				L"plugin_config/obs-streamelements-core/sentry-db",
+				// The whole CEF profile, not the two dozen
+				// individual entries this replaces. Almost
+				// entirely Chromium's own state -- caches,
+				// component-updater payloads, leveldb stores --
+				// large, reproducible from a fresh profile, and
+				// evidence of nothing. The enumerated form was
+				// also permanently one Chromium release behind,
+				// since those directories arrive on demand.
+				L"plugin_config/obs-browser/",
+				// Our own binaries, and only ours. We build
+				// them, so their bytes tell us nothing we
+				// cannot get from the build. Third-party
+				// plugins in the same folder are kept
+				// deliberately -- they are the ones nobody
+				// else can hand us. Kept in step with
+				// StreamElementsCrashContext.cpp.
+				L"plugins/obs-streamelements-core.plugin/contents/macos/",
+				L"plugins/obs-streamelements-core/bin/",
 				L"updates/",
 				L"profiler_data/",
 				L"obslive_restored_files/",
-				L"plugin_config/obs-browser/streamelements_restored_files/",
 				L"crashes/"
 			};
 
@@ -504,7 +552,7 @@ void StreamElementsReportIssueDialog::accept()
 		if (!dialog.cancelled()) {
 			dialog.setMessage(obs_module_text(
 				"StreamElements.ReportIssue.Progress.Message.CollectingCpuBenchmark"));
-			qApp->sendPostedEvents();
+			SEDrainEventQueue();
 
 			cpu_benchmark = GetCpuCoreBenchmark(
 				CPU_BENCH_TOTAL, cpu_bench_delta);
@@ -513,7 +561,7 @@ void StreamElementsReportIssueDialog::accept()
 		if (!dialog.cancelled()) {
 			dialog.setMessage(obs_module_text(
 				"StreamElements.ReportIssue.Progress.Message.CollectingSysInfo"));
-			qApp->sendPostedEvents();
+			SEDrainEventQueue();
 
 			{
 				CefRefPtr<CefValue> basicInfo =

@@ -379,6 +379,18 @@ void StreamElementsGlobalStateManager::Destroy()
 	s_instance = nullptr;
 }
 
+void StreamElementsGlobalStateManager::Leak()
+{
+	// Heap-allocated and never freed, so the refcount never reaches zero
+	// and no destructor runs -- not now, and not during static destruction
+	// at process exit either.
+	if (s_instance.get())
+		new std::shared_ptr<StreamElementsGlobalStateManager>(
+			s_instance);
+
+	s_instance = nullptr;
+}
+
 bool StreamElementsGlobalStateManager::IsInstanceAvailable()
 {
 	if (!s_instance.get())
@@ -394,8 +406,12 @@ void StreamElementsGlobalStateManager::Initialize(QMainWindow *obs_main_window)
 {
 	m_mainWindow = obs_main_window;
 
-	// Initialize on the main thread
-	m_crashHandler = new StreamElementsCrashHandler();
+	// Initialize on the main thread.
+	//
+	// Which backend this is -- BugSplat, Sentry, or none at all -- is decided
+	// at build time by the STREAMELEMENTS_CRASH_HANDLER CMake variable. Create()
+	// returns nullptr when crash reporting is compiled out.
+	m_crashHandler = StreamElementsCrashHandler::Create();
 
 	/*
 	struct local_context {
@@ -499,6 +515,18 @@ void StreamElementsGlobalStateManager::Initialize(QMainWindow *obs_main_window)
 		std::make_shared<WindowStateChangeEventFilter>(
 			mainWindow());
 
+#ifdef SE_ENABLE_WYVRN
+	// After the websocket API server, because reaching Ok or a failure
+	// status dispatches hostRazerWyvrnStatusChanged through it.
+	//
+	// Start() returns immediately. CoreInitSDK costs a flat ~3.3 s, so it
+	// runs on the manager's own SDK thread and OBS start is not delayed;
+	// WYVRN becomes available a few seconds into the session.
+	m_razerWyvrnManager =
+		std::make_shared<StreamElementsRazerWyvrnManager>();
+	m_razerWyvrnManager->Start();
+#endif
+
 	m_outputManager =
 		std::make_shared<StreamElementsOutputManager>(
 			m_videoCompositionManager, m_audioCompositionManager);
@@ -512,8 +540,20 @@ void StreamElementsGlobalStateManager::Initialize(QMainWindow *obs_main_window)
 
 	m_appStateListener = new ApplicationStateListener();
 	m_themeChangeListener = new ThemeChangeListener();
+
+	// objectName, because QMainWindow::saveState() and restoreState()
+	// identify docks by it and Qt's documentation requires it to be set for
+	// every dock in the window. This one had none, so it was saved and
+	// matched under an empty key (CORE-967).
+	m_themeChangeListener->setObjectName("streamelements_theme_listener");
+
+	// Bottom on both platforms now. The Windows branch passed
+	// Qt::NoDockWidgetArea, which addDockWidget rejects -- the dock was
+	// never added at all, which is one of the four "invalid 'area'
+	// argument" warnings in every OBS log. It is invisible and floating
+	// either way; see StreamElementsWidgetManager::AddDockWidget.
 	mainWindow()->addDockWidget(Qt::BottomDockWidgetArea,
-					m_themeChangeListener);
+				    m_themeChangeListener);
 
 	{
 		// Set up "Live Support" button
@@ -639,9 +679,21 @@ void StreamElementsGlobalStateManager::Initialize(QMainWindow *obs_main_window)
 		RestoreState();
 	}
 
-	QApplication::sendPostedEvents();
+	// Draining the posted-event queue runs arbitrary code while this
+	// Initialize() is still on the stack and m_initialized is still false:
+	// deferred deletes, frontend callbacks, and any modal dialog's own event
+	// loop. Nothing constructed above may be assumed live below this point.
+	SEDrainEventQueue();
 
-	m_menuManager->Update();
+	// Guarded because of the pump above, not out of caution. Observed: OBS
+	// held OBSInit open in its modal update dialog for ~5 minutes, and by the
+	// time this line ran m_menuManager was null. The fault then landed inside
+	// UpdateInternal's own `if (!m_menu)` guard -- SYNC_ACCESS() locks a
+	// static mutex, so it touches no member, which makes that guard the first
+	// read through `this` and therefore the crash site rather than the
+	// protection it looks like.
+	if (m_menuManager)
+		m_menuManager->Update();
 
 	{
 		json11::Json::object eventProps;
@@ -660,17 +712,29 @@ void StreamElementsGlobalStateManager::Initialize(QMainWindow *obs_main_window)
 			->trackEvent("se_live_initialized", eventProps, fields);
 	}
 
-	//QtPostTask([]() {
-		// Update visible state
-		StreamElementsGlobalStateManager::GetInstance()
-			->GetMenuManager()
-			->Update();
-	//});
+	// Update visible state.
+	//
+	// Through m_menuManager, not GetInstance()->GetMenuManager(): this is a
+	// member function and the member is right here. Going through the singleton
+	// is what crashed. GetInstance() lazily constructs when s_instance is not
+	// this instance, and a freshly constructed manager has every shared_ptr
+	// member null -- so ->Update() ran on a null StreamElementsMenuManager.
+	//
+	// Confirmed from two minidumps of the same fault: UpdateInternal entered
+	// with this == nullptr, while this->m_menuManager on the instance running
+	// Initialize() was non-null. Two different objects; the singleton returned
+	// the empty one.
+	if (m_menuManager)
+		m_menuManager->Update();
 
 	streamelements_updater_init();
 
 	m_persistStateEnabled = true;
 	m_initialized = true;
+
+	// From here on an OBS close is an ordinary close, and teardown runs
+	// normally (CORE-786).
+	SENoteInitializeCompleted();
 
 	obs_frontend_add_event_callback(handle_obs_frontend_event, nullptr);
 }
@@ -684,6 +748,11 @@ void StreamElementsGlobalStateManager::Shutdown()
 	}
 
 	m_isShuttingDown = true;
+
+	// Before anything below blocks. From here the Qt main thread is ours and
+	// will not return to its event loop, so a worker waiting on QtExecSync
+	// must be released rather than left to deadlock us (CORE-1131).
+	SetShuttingDown();
 
 	obs_frontend_remove_event_callback(handle_obs_frontend_event, nullptr);
 
@@ -703,15 +772,26 @@ void StreamElementsGlobalStateManager::Shutdown()
 
 	streamelements_updater_shutdown();
 
-#ifdef WIN32
-	// Shutdown on the main thread
+	// Early, and explicitly rather than by releasing the pointer: this
+	// joins the SDK thread, which unwinds through CoreUnInit() on its way
+	// out. Two things must still be alive while that happens -- the
+	// websocket API server, so the ShuttingDown status reaches the page,
+	// and the crash handler below, so a fault inside Razer's DLL is still
+	// reported.
+#ifdef SE_ENABLE_WYVRN
+	if (m_razerWyvrnManager) {
+		m_razerWyvrnManager->Shutdown();
+	}
+#endif
+
+	// Shutdown on the main thread. No platform guard: StopAsyncHangDetection()
+	// is a no-op on backends that have no hang detection.
 	if (m_crashHandler) {
 		m_crashHandler->StopAsyncHangDetection();
 
 		//delete m_crashHandler; // TODO: Shutting down the crash handler might be contributing to us missing some exceptions during shutdown
 		//m_crashHandler = nullptr;
 	}
-#endif
 	
 	//mainWindow()->removeDockWidget(m_themeChangeListener);
 	if (m_themeChangeListener) {
@@ -749,6 +829,9 @@ void StreamElementsGlobalStateManager::Shutdown()
 
 	m_profilesManager = nullptr;
 	m_backupManager = nullptr;
+#ifdef SE_ENABLE_WYVRN
+	m_razerWyvrnManager = nullptr;
+#endif
 	m_cleanupManager = nullptr;
 	m_previewManager = nullptr;
 	m_websocketApiServer = nullptr;
@@ -768,7 +851,7 @@ void StreamElementsGlobalStateManager::Shutdown()
 
 	StreamElementsConfig::Destroy();
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	m_initialized = false;
 }
@@ -1169,6 +1252,24 @@ void StreamElementsGlobalStateManager::RestoreState()
 
 	CefRefPtr<CefValue> root =
 		CefParseJSON(json, JSON_PARSER_ALLOW_TRAILING_COMMAS);
+
+	// CefParseJSON returns null for anything it cannot parse, and CefRefPtr
+	// is std::shared_ptr here, so calling through it is a hard dereference of
+	// null. The check below used to be the only one, and it tests the wrong
+	// value one line too late.
+	//
+	// The state we are parsing is persisted, so this is not a one-off crash:
+	// every subsequent launch reads the same bad blob back and dies in the
+	// same place, before anything else runs (CORE-1601). Returning here
+	// leaves the user with default state, which is recoverable; crashing
+	// leaves them with an application that cannot start.
+	if (!root.get()) {
+		blog(LOG_WARNING,
+		     "obs-streamelements-core: state: discarding unparsable startup state");
+
+		return;
+	}
+
 	CefRefPtr<CefDictionaryValue> rootDictionary = root->GetDictionary();
 
 	if (!rootDictionary.get()) {
@@ -1339,7 +1440,7 @@ bool StreamElementsGlobalStateManager::DeserializeModalDialog(
 
 			dialog->setFixedSize(width, height);
 
-			QApplication::sendPostedEvents();
+			SEDrainEventQueue();
 
 			dialog->setMinimumSize(width, height);
 			dialog->setMaximumSize(savedMaxSize);
@@ -1562,7 +1663,7 @@ std::shared_ptr<std::promise<CefRefPtr<CefValue>>> StreamElementsGlobalStateMana
 
 			dialog->setFixedSize(width, height);
 
-			QApplication::sendPostedEvents();
+			SEDrainEventQueue();
 
 			dialog->setMinimumSize(width, height);
 			dialog->setMaximumSize(savedMaxSize);

@@ -154,6 +154,17 @@ Importante:
 
 Core SE.Live OBS plugin.
 
+### JavaScript OBS API
+
+The host API this plugin exposes to page JavaScript — 217 `window.host` calls,
+104 `window` events and methods, and 70 data structures — is documented in
+**[`docs/api/`](docs/api/)**, accessible at <a href="https://streamelements.github.io/obs-streamelements-core/api/" target="_blank">https://streamelements.github.io/obs-streamelements-core/api/</a> currently at API version 6.6.
+
+That tree is the source of truth. It replaces `JavaScript OBS API Version
+6.6.docx`, which is not in version control; see
+[`tools/docx-to-markdown/`](tools/docx-to-markdown/) for how it was converted
+and verified.
+
 ### Building locally
 
 This plugin does not build on its own. It is built as part of an obs-studio
@@ -221,20 +232,7 @@ cd build_macos_arm64 && xcodebuild -configuration RelWithDebInfo \
 
 ## Release channels status
 
-|Platform 	|Environment 	|Version 	|
-|---	|---	|---	    |
-| Windows | `signed` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.version.svg" /> |
-| Windows | `qa` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/qa/obs-streamelements.version.svg" /> |
-| Windows | `beta` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/beta/obs-streamelements.version.svg" /> |
-| Windows | `latest` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/latest/obs-streamelements.version.svg" /> |
-| Windows | `stable` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/stable/obs-streamelements.version.svg" /> |
-| MacOS | `signed` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/macos/signed/obs-streamelements.version.svg" /> |
-| MacOS | `qa` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/macos/qa/obs-streamelements.version.svg" /> |
-| MacOS | `beta` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/macos/beta/obs-streamelements.version.svg" /> |
-| MacOS | `latest` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/macos/latest/obs-streamelements.version.svg" /> |
-| MacOS | `stable` | <img src="https://cdn.streamelements.com/obs/dist/obs-streamelements/macos/stable/obs-streamelements.version.svg" /> |
-
-<a href="https://cdn.streamelements.com/obs/qa/status.html" target="_blank">Extended Status Page</a>
+<a href="https://streamelements.github.io/obs-streamelements-core/status.html" target="_blank">Extended Status Page</a> — every channel on both platforms, with build dates, promotion drift and release notes, read live from the CDN manifests. Source: <a href="docs/status.html">docs/status.html</a>.
 
 ## Deployment
 
