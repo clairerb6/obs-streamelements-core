@@ -10,15 +10,17 @@
 #   L         the version currently sitting on the `latest` channel (the `to` channel,
 #             relevant only on a stable -> latest rollback, where the upload replaces it)
 
-# Delimiters that fence the pristine RELEASE_NOTES.md inside a release body. build.yml
-# writes them; release.yml reads back between them. They are what makes recomposing a
-# body idempotent rather than cumulative -- without them, each promotion would wrap the
+# Delimiters that fence the pristine RELEASE_NOTES.md inside the notes artifact, and so
+# inside every release body composed from it. build.yml writes them; release.yml reads
+# back between them when the artifact is missing. They are what makes recomposing a body
+# idempotent rather than cumulative -- without them, each promotion would wrap the
 # previous body (summary + notes + changelog) inside a new one.
 RELEASE_NOTES_BEGIN='<!-- SE_RELEASE_NOTES_BEGIN -->'
 RELEASE_NOTES_END='<!-- SE_RELEASE_NOTES_END -->'
 
-# Present only on a body that publish.sh has already composed. Used to short-circuit the
-# second platform's promotion of the same version.
+# Present on any body publish.sh has composed, at every channel. Used to short-circuit
+# the second platform's promotion of the same version, which would otherwise recompose
+# an identical body for no reason.
 PUBLISHED_MARKER='<!-- SE_RELEASE_PUBLISHED -->'
 
 # Written to a channel when the build being published there has no notes of its own.
@@ -27,7 +29,7 @@ PUBLISHED_MARKER='<!-- SE_RELEASE_PUBLISHED -->'
 # has to be replaced too -- leaving the previous one behind would make the channel serve
 # notes describing a build it no longer points at. A placeholder keeps the three in step
 # without pretending the notes exist; publish.sh treats a file carrying this marker as
-# absent and falls back to the notes recovered from the prerelease.
+# absent and falls back to the notes recovered from an existing release body.
 NOTES_UNAVAILABLE_MARKER='<!-- SE_RELEASE_NOTES_UNAVAILABLE -->'
 
 CDN_BASE='https://cdn.streamelements.com/obs/dist/obs-streamelements'
@@ -189,9 +191,12 @@ resolve_previous_full_tag() {
 		fi
 	fi
 
-	# The changelog needs the tag object, not merely a release. Not every version that
-	# has reached a channel was tagged: windows/stable currently references
-	# 20241127000268, and tag 24.11.27.268 does not exist in this repo.
+	# The changelog needs the tag object, not merely a release, and a version that
+	# reached a channel is not guaranteed to have been tagged. windows/stable served
+	# 20241127000268 for a long time with no 24.11.27.268 tag; the tag and a back-filled
+	# release were created by hand on 2026-08-25, so that particular gap is closed, but
+	# the guard stays -- nothing in the pipeline enforces that a channel version was
+	# ever tagged.
 	if [ -n "$_prev" ] && ! git rev-parse -q --verify "refs/tags/$_prev^{commit}" > /dev/null 2>&1; then
 		warn "previous tag '$_prev' is not present in this clone; the changelog will be omitted"
 		_prev=""

@@ -615,6 +615,18 @@ void StreamElementsBrowserWidget::DestroyBrowser()
 	if (os_atomic_set_bool(&m_isDestroyed, true))
 		return;
 
+	//
+	// This is the window that matters: below, obs-browser's closeBrowser()
+	// spins a nested event loop, and Qt can repaint the main window while
+	// this widget is part-way destroyed (CORE-1922, SELIVE-8G).
+	//
+	// The panel's URL without its query string: those carry access tokens,
+	// and this ends up on a crash report.
+	//
+	const std::string panel = m_url.substr(0, m_url.find_first_of("?#"));
+
+	SEWidgetTeardownScope marker("browser-widget", panel.c_str());
+
 	ShutdownApiMessagehandler();
 
 	{
@@ -758,18 +770,24 @@ void StreamElementsBrowserWidget::RemoveVideoCompositionView()
 	if (!m_activeVideoCompositionViewWidget)
 		return;
 
+	// Both members are QPointer, so a widget Qt already destroyed -- these
+	// are children of this widget and of each other -- reads back null and
+	// is not deleted a second time (CORE-786). Destroy() still has to run
+	// deterministically, which is why these are deleted by hand rather than
+	// left to the parent.
 	m_activeVideoCompositionViewWidget->hide();
 	m_activeVideoCompositionViewWidget->Destroy();
 	m_activeVideoCompositionViewWidget->setParent(nullptr);
-	delete m_activeVideoCompositionViewWidget;
-	// m_activeVideoCompositionViewWidget->deleteLater();
+	delete m_activeVideoCompositionViewWidget.data();
 
 	m_activeVideoCompositionViewWidget = nullptr;
 
-	m_activeVideoCompositionViewWidgetContainer->hide();
-	m_activeVideoCompositionViewWidgetContainer->setParent(nullptr);
-	delete m_activeVideoCompositionViewWidgetContainer;
-	//m_activeVideoCompositionViewWidgetContainer->deleteLater();
+	if (m_activeVideoCompositionViewWidgetContainer) {
+		m_activeVideoCompositionViewWidgetContainer->hide();
+		m_activeVideoCompositionViewWidgetContainer->setParent(
+			nullptr);
+		delete m_activeVideoCompositionViewWidgetContainer.data();
+	}
 
 	m_activeVideoCompositionViewWidgetContainer = nullptr;
 }

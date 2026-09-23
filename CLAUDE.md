@@ -14,9 +14,27 @@ This plugin does **not** build standalone. It must sit at `obs-studio/plugins/ob
 
 **New source files must be added by hand** to the explicit `obs-streamelements-core_SOURCES` / `obs-streamelements-core_HEADERS` lists in `CMakeLists.txt` — there is no globbing. New qrc assets go in both `streamelements/streamelements.qrc` and the `qt6_add_resources(...)` `FILES` list.
 
+**Crash-reporting backend is a build-time choice**: `-DSTREAMELEMENTS_CRASH_HANDLER=bugsplat|sentry|none` (default `bugsplat`). One variable drives which handler compiles, which SDK links, and the `SE_CRASH_HANDLER_*` define the factory in `StreamElementsCrashHandler.cpp` reads — keep those three together. Only one backend is ever linked, so two can't contend for the process exception filter. sentry-native is vendored as `deps/sentry-native.zip` and extracted by CMake into the *build* tree; there is no unzip step to run. The Sentry DSN is baked into `STREAMELEMENTS_SENTRY_DSN` and is **not** a secret — a DSN only permits submitting events. `SENTRY_AUTH_TOKEN`/`SENTRY_ORG`/`SENTRY_PROJECT` are CI-only, for symbol upload.
+
+**The `string(REPLACE "/MD" "/MT" ...)` block in `CMakeLists.txt` is dead code.** obs-studio sets the runtime through the `MSVC_RUNTIME_LIBRARY` target property, so the flags never contain a literal `/MD` and nothing is replaced. This project is `/MD` (`MultiThreadedDLL`), same as libobs — vendored libraries must match, or the link fails with `LNK4098`, which `/WX` promotes to a hard error.
+
 ## Tests
 
-There are none — no ctest, gtest, or catch2 anywhere in project code. The only gates are that it compiles and that `CI/check-format.sh` passes. Don't describe a change as verified on the basis of tests.
+`tests/` holds a small ctest suite, off by default (`-DSE_ENABLE_TESTS=ON`, or configure `tests/` directly). It is **not** part of the plugin build: the tests are standalone C++17 executables that link neither libobs nor Qt, so they build and run without an obs-studio tree — on any platform, in seconds.
+
+```sh
+cmake -S tests -B tests/build && cmake --build tests/build
+ctest --test-dir tests/build --output-on-failure
+```
+
+Two kinds live there, and `se_add_test(<name> <sources>)` in `tests/CMakeLists.txt` registers both:
+
+- **Behavioural** — exercise real logic directly, or a minimal mirror of it where the real thing is entangled with libobs.
+- **Source-invariant** — open the production sources and assert a fixed bug pattern is absent, so a regression is caught without needing the OBS build to succeed.
+
+Anything self-contained enough to compile without libobs/Qt belongs here rather than in a throwaway harness — parsers, redaction, string handling, pure helpers. Deliberately keeping a unit under test free of OBS dependencies is a good reason to structure it that way.
+
+CI does **not** run these yet, so they are a local gate: the pipeline still only proves that it compiles and that `CI/check-format.sh` passes. Don't call a change verified on the basis of tests that were never run against it.
 
 ## Formatting
 
@@ -43,7 +61,8 @@ Format only the files you edited: `clang-format -i -style=file -fallback-style=n
 ## Git
 
 - Never commit to `master`. Branch and open a PR (`gh pr create`), even for small fixes.
-- **Put the Linear issue key in the branch name** (`jacob/core-266-track-selive-releases`). Linear links the PR to the issue from that name, and the `qa -> beta` promotion attaches those issues to the Linear release. master is squash-merged, so a branch without a key leaves the work untraceable — the commit subject keeps only `(#93)`, and that PR links to nothing. `linear-issue-key.yml` enforces this and will suggest an issue when it fails; label a PR `no-linear-issue` if there genuinely isn't one. A key in the PR title or a `Fixes CORE-266` line in the body works too.
+- **Put the Linear issue key in the branch name** (`jacob/core-266-track-selive-releases`). Linear links the PR to the issue from that name, and the `qa -> beta` promotion attaches those issues to the Linear release. master is squash-merged, so a branch without a key leaves the work untraceable — the commit subject keeps only `(#93)`, and that PR links to nothing. `linear-issue-key.yml` enforces this; label a PR `no-linear-issue` if there genuinely isn't one. A key in the PR title or a `Fixes CORE-266` line in the body works too. Anything needing Linear API *write* access — suggesting a key, reopening an issue — runs through the Linear MCP, not CI: a workspace-scoped key in Actions was rejected on security grounds.
+- **Put `#partial` in the title or body of a PR that does not finish its issue.** Linear closes an issue when any linked PR merges, which is wrong when the work is split across several PRs — CORE-554 was closed by the first of three. **CI cannot undo this**: it needs a Linear API key, and a workspace-scoped key in Actions was rejected on security grounds. `#partial` is a marker for humans and agents, not automation — `linear-issue-key.yml` only surfaces it on the check. After merging such a PR, reopen the issue via the Linear MCP (`save_issue` with `state: "In Progress"`).
 - Conventional Commits: `fix:`, `feat:`, with scopes where they apply (`fix(ci):`, `fix(workflow):`).
 - **Never start a commit message with `[WORKFLOW-AUTOMATION]`** — CI uses that prefix to recognize its own commits and skip the build.
 - `RELEASE_NOTES.md` must be non-empty for a master build to tag a release. Use `/release-prep`.

@@ -82,55 +82,63 @@ fi
 # -------------------------------------------------------------------- Linear sync base
 # `qa -> beta` is the hop at which a build becomes something worth announcing, so that is
 # where release.yml creates the Linear release for it. The commit scan needs a lower
-# bound, and the honest one is "whatever beta served until a moment ago" -- which is the
-# version sitting on the destination channel right now. Reading it here rather than after
-# the upload is the same ordering constraint the rollback path has, for the same reason:
-# the upload is about to overwrite it with the version being promoted.
+# bound, and the honest one is "whatever the destination channel served until a moment
+# ago" -- the version sitting on it right now. Reading it here rather than after the
+# upload is the same ordering constraint the rollback path has, for the same reason: the
+# upload is about to overwrite it with the version being promoted.
+#
+# Computed for every forward hop, not just beta. It was beta-only until the release and
+# its issues moved to signed -> qa, which left that hop passing no base at all: the CLI
+# logged "No recent releases found; assuming first sync", inspected the single HEAD
+# commit, and attached one issue to release 26.8.20.897 where the range held eight.
 #
 # Windows and macOS promote separately, so the second platform through reads back the
 # first one's upload and resolves an empty range. That is correct rather than a bug: the
 # issues were attached on the first pass and `sync` for the same version adds nothing.
 #
-# Nothing below this point applies to a beta promotion -- no release is created or
-# relabelled there, so requirement 10 must not fire and there is no changelog to base.
-if [ "${SE_TO:-}" = "beta" ]; then
+# Unlike the rollback branch above this one falls through: every promotion now writes a
+# release, so previous_tag and the recovered notes are needed on this hop too.
+case "${SE_TO:-}" in
+qa | beta | latest)
 	BASE=""
-	beta="${RUNNER_TEMP:-/tmp}/se-beta-$PLATFORM.manifest"
+	dest="${RUNNER_TEMP:-/tmp}/se-$SE_TO-$PLATFORM.manifest"
 	# stderr is dropped because manifest_version_number reports a parse failure with
 	# die(), and an ::error:: annotation would misrepresent what is only a missing lower
 	# bound: the CLI falls back to its own scan base and the sync still happens.
-	if fetch_channel_manifest "$PLATFORM" beta "$beta" && B=$(manifest_version_number "$beta" 2> /dev/null); then
+	if fetch_channel_manifest "$PLATFORM" "$SE_TO" "$dest" && B=$(manifest_version_number "$dest" 2> /dev/null); then
 		if [ "$B" -ge "$ENCODED" ]; then
-			note "linear: $PLATFORM/beta already serves $B (>= $ENCODED); no new commits to scan"
+			note "linear: $PLATFORM/$SE_TO already serves $B (>= $ENCODED); no new commits to scan"
 		else
 			BASE=$(decode_version "$B")
-			note "linear: $PLATFORM/beta serves $B; scanning $BASE..$TAG"
+			note "linear: $PLATFORM/$SE_TO serves $B; scanning $BASE..$TAG"
 		fi
 	else
-		warn "linear: no readable version on $PLATFORM/beta; the CLI will choose its own scan base"
+		warn "linear: no readable version on $PLATFORM/$SE_TO; the CLI will choose its own scan base"
 	fi
 
 	# The scan is `git log <base>..<tag>`, so the lower bound has to exist as a tag in
-	# this clone. Not every version that reached a channel was tagged -- windows/stable
-	# references 20241127000268 and tag 24.11.27.268 was never pushed -- so this is a live
-	# condition rather than a hypothetical.
+	# this clone, and a version that reached a channel is not guaranteed to have one.
+	# windows/stable served 20241127000268 with no 24.11.27.268 tag until both it and a
+	# back-filled release were created by hand on 2026-08-25. The guard stays: the
+	# pipeline never enforced the invariant, so it can recur.
 	if [ -n "$BASE" ] && ! git rev-parse -q --verify "refs/tags/$BASE^{commit}" > /dev/null 2>&1; then
 		warn "linear: tag '$BASE' is not present in this clone; the CLI will choose its own scan base"
 		BASE=""
 	fi
 
 	emit previous_channel_tag "$BASE"
-	exit 0
-fi
+	;;
+esac
 
-# ------------------------------------------------------------------ requirement 10
-# A version may not reach `latest` without a release. The usual cause is a build whose
-# RELEASE_NOTES.md was empty: build.yml then skips both the tag and the prerelease, so
-# there is nothing to promote. Failing here means it fails before anything ships.
+# A release no longer exists before the first promotion -- signed -> qa is what creates
+# it -- so its absence is reported rather than fatal. Requirement 10, "nothing reaches
+# `latest` without a release", is enforced in publish.sh, which is the step that knows
+# which hop this is and can still create one.
 if IS_PRERELEASE=$(gh release view "$TAG" --json isPrerelease -q .isPrerelease 2>/dev/null); then
 	note "GitHub release $TAG exists (prerelease=$IS_PRERELEASE)"
 else
-	die "version $ENCODED decodes to tag $TAG, which has no GitHub release. The master build that produced it almost certainly ran with an empty RELEASE_NOTES.md, so .github/workflows/build.yml skipped both the tag and the [BETA] prerelease. Add release notes and rebuild, or create tag $TAG and its prerelease by hand, before promoting this build to 'latest'."
+	IS_PRERELEASE=""
+	note "no GitHub release for $TAG yet; this promotion will create it"
 fi
 emit is_prerelease "$IS_PRERELEASE"
 
@@ -140,10 +148,37 @@ resolve_previous_full_tag "$BUILD" "$ENCODED"
 PREV_TAG="$PREV_FULL_TAG"
 emit previous_tag "$PREV_TAG"
 
+# ------------------------------------------------------------------ Linear scan base
+# The Linear release must list every issue fixed since the last FULL release, so its
+# commit scan takes the same lower bound as the changelog in the GitHub release body --
+# PREV_TAG -- rather than the version currently on the destination channel.
+#
+# Those two ranges are not the same range. Consecutive qa builds are a day or two apart,
+# while a full release can be weeks back, so scanning only the channel range is what left
+# Linear release 26.8.20.897 holding a fraction of what the changelog listed. Same base,
+# same commits, same issues, by construction.
+#
+# previous_channel_tag remains the fallback and is strictly better than nothing: until
+# the first full release exists PREV_TAG resolves only through the `latest` manifest
+# bootstrap, and when that is unavailable too it is empty. An empty base_ref sends the
+# CLI back to its own scan base -- one commit, one issue -- which is the failure this is
+# here to prevent.
+LINEAR_BASE="$PREV_TAG"
+if [ -z "$LINEAR_BASE" ] && [ -n "${BASE:-}" ]; then
+	LINEAR_BASE="$BASE"
+	note "linear: no previous full release; falling back to channel base $LINEAR_BASE"
+fi
+if [ -n "$LINEAR_BASE" ]; then
+	note "linear: issue scan range $LINEAR_BASE..$TAG"
+else
+	warn "linear: no scan base resolved; the CLI will fall back to its own, which sees only the head commit"
+fi
+emit linear_base_tag "$LINEAR_BASE"
+
 # ------------------------------------------------------------------- requirement 5
-# Recover the pristine RELEASE_NOTES.md that build.yml fenced into the prerelease body.
-# Done here rather than in publish.sh because Claude needs it as input, and Claude runs
-# in between.
+# Recover the pristine RELEASE_NOTES.md fenced into an existing release body. This is a
+# fallback: the notes artifact fetched from the source channel is the primary source,
+# and on signed -> qa there is no release to recover from yet.
 : > "$OUTDIR/notes.md"
 gh release view "$TAG" --json body -q .body > "$OUTDIR/body.md" 2>/dev/null || : > "$OUTDIR/body.md"
 awk -v b="$RELEASE_NOTES_BEGIN" -v e="$RELEASE_NOTES_END" '
@@ -162,4 +197,6 @@ if [ ! -s "$OUTDIR/notes.md" ] && [ -r RELEASE_NOTES.history.md ]; then
 		found            { print }
 	' RELEASE_NOTES.history.md > "$OUTDIR/notes.md" || :
 fi
-[ -s "$OUTDIR/notes.md" ] || warn "no release notes recovered for $TAG"
+if [ ! -s "$OUTDIR/notes.md" ]; then
+	note "no notes recovered from a release body for $TAG; the channel artifact will be used"
+fi

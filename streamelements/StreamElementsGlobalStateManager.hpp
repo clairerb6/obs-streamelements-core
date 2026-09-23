@@ -28,6 +28,9 @@ struct QCefCookieManager;
 #include "StreamElementsNativeOBSControlsManager.hpp"
 #include "StreamElementsProfilesManager.hpp"
 #include "StreamElementsBackupManager.hpp"
+#ifdef SE_ENABLE_WYVRN
+#include "StreamElementsRazerWyvrnManager.hpp"
+#endif
 #include "StreamElementsCleanupManager.hpp"
 #include "StreamElementsPreviewManager.hpp"
 #include "StreamElementsWebsocketApiServer.hpp"
@@ -89,6 +92,12 @@ public:
 public:
 	static std::shared_ptr<StreamElementsGlobalStateManager> GetInstance();
 	static void Destroy();
+
+	// Releases the singleton WITHOUT running any destructor, by parking a
+	// reference that is never freed. Used when OBS asked to close before
+	// initialization completed: the object graph is half-built and running
+	// its destructors corrupts the widget tree (CORE-786).
+	static void Leak();
 	static bool IsInstanceAvailable();
 
 public:
@@ -184,6 +193,12 @@ public:
 	{
 		return m_backupManager;
 	}
+#ifdef SE_ENABLE_WYVRN
+	std::shared_ptr<StreamElementsRazerWyvrnManager> GetRazerWyvrnManager()
+	{
+		return m_razerWyvrnManager;
+	}
+#endif
 	std::shared_ptr<StreamElementsCleanupManager> GetCleanupManager()
 	{
 		return m_cleanupManager;
@@ -261,8 +276,8 @@ private:
 	bool m_persistStateEnabled = false;
 	bool m_initialized = false;
 	bool m_isShuttingDown = false;
-	QMainWindow *m_mainWindow = nullptr;
-	QWidget *m_nativeCentralWidget = nullptr;
+	QPointer<QMainWindow> m_mainWindow = nullptr;
+	QPointer<QWidget> m_nativeCentralWidget = nullptr;
 	std::shared_ptr<StreamElementsBrowserWidgetManager> m_widgetManager =
 		nullptr;
 	std::shared_ptr<StreamElementsObsSceneManager> m_obsSceneManager =
@@ -289,6 +304,10 @@ private:
 	std::shared_ptr<StreamElementsProfilesManager> m_profilesManager =
 		nullptr;
 	std::shared_ptr<StreamElementsBackupManager> m_backupManager = nullptr;
+#ifdef SE_ENABLE_WYVRN
+	std::shared_ptr<StreamElementsRazerWyvrnManager> m_razerWyvrnManager =
+		nullptr;
+#endif
 	std::shared_ptr<StreamElementsCleanupManager> m_cleanupManager =
 		nullptr;
 	std::shared_ptr<StreamElementsPreviewManager> m_previewManager =
@@ -334,6 +353,6 @@ private:
 		QTimer m_timer;
 	};
 
-	QDockWidget *m_themeChangeListener = nullptr;
+	QPointer<QDockWidget> m_themeChangeListener = nullptr;
 	ApplicationStateListener *m_appStateListener = nullptr;
 };

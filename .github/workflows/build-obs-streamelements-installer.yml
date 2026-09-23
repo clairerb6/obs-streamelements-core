@@ -22,6 +22,15 @@ on:
         required: true
         type: string
 
+      # The Claude-written "What's New" blurb, base64-encoded, from build.yml's summary
+      # job. Base64 because it is multi-line, and because it keeps model-authored text
+      # out of GitHub expression interpolation. Empty when no summary was produced, in
+      # which case the release notes are composed exactly as they were before.
+      WHATS_NEW_BASE64:
+        required: false
+        default: ''
+        type: string
+
     secrets:
       AZURE_TENANT_ID:
         required: true
@@ -67,22 +76,65 @@ jobs:
       - name: Create release notes
         id: release_notes_step
         
+        env:
+          # Never interpolated into the script: decoded from an environment variable so
+          # model-authored text cannot reach the shell as code.
+          WHATS_NEW_BASE64: ${{ inputs.WHATS_NEW_BASE64 }}
         run: |
+          # The per-version notes: this release's heading, its notes, then history.
           echo "### ${{ inputs.PLUGIN_VERSION_STRING }}" >> /tmp/release_notes_raw.md
           echo "" >> /tmp/release_notes_raw.md
           cat "RELEASE_NOTES.md" >> /tmp/release_notes_raw.md
           echo "" >> /tmp/release_notes_raw.md
           cat "RELEASE_NOTES.history.md" >> /tmp/release_notes_raw.md
 
+          # The product blurb, minus the "## Release Notes" heading it ends with.
+          # That heading is emitted further down instead, so "What's New" can sit
+          # beside it as a sibling section rather than nested inside one release's
+          # notes -- previously it landed as an <h4> under "## Release Notes" >
+          # "### <version>", which read as part of that version's notes rather than
+          # as a section of its own.
+          #
+          # Stripped unconditionally so this stays correct if the header ever stops
+          # carrying the heading.
+          sed -E '/^## Release Notes[[:space:]]*$/d' "RELEASE_NOTES.header.md" > /tmp/header_body.md
 
-          cat "RELEASE_NOTES.header.md" >> /tmp/release_notes_full.md
+          cat /tmp/header_body.md >> /tmp/release_notes_full.md
+          echo "" >> /tmp/release_notes_full.md
+
+          # "What's New" is a top-level section, above Release Notes, and describes
+          # only the release being built -- it is deliberately never archived into
+          # RELEASE_NOTES.history.md. Appears only when there is a blurb; without one
+          # the page keeps exactly its previous shape.
+          if [ -n "${WHATS_NEW_BASE64:-}" ]; then
+            echo "$WHATS_NEW_BASE64" | base64 -d > /tmp/whats_new.md
+
+            if [ -s /tmp/whats_new.md ]; then
+              echo "## What's New" >> /tmp/release_notes_full.md
+              echo "" >> /tmp/release_notes_full.md
+              cat /tmp/whats_new.md >> /tmp/release_notes_full.md
+              # printf, not echo: the blurb has no trailing newline, so a single echo
+              # only terminates its last line and leaves the next heading glued to it
+              # with no blank line between -- which Markdown will not read as a heading.
+              printf '\n\n' >> /tmp/release_notes_full.md
+            fi
+          fi
+
+          echo "## Release Notes" >> /tmp/release_notes_full.md
           echo "" >> /tmp/release_notes_full.md
           cat /tmp/release_notes_raw.md >> /tmp/release_notes_full.md
           echo "" >> /tmp/release_notes_full.md
           cat "RELEASE_NOTES.footer.md" >> /tmp/release_notes_full.md
 
           # Generate HTML
-          markdown-to-html-cli --source /tmp/release_notes_full.md --output /tmp/release_notes.raw.html --no-dark-mode --markdown-style-theme dark --no-corners --style ".markdown-style { max-width: 100% !important; }"
+          # Arial throughout, headings and code included. These notes are rendered
+          # inside the updater's embedded browser, whose default font stack does not
+          # match the rest of the product. The universal selector plus !important is
+          # deliberate: the generator's own theme sets font-family on several
+          # elements, and anything less specific loses to it.
+          NOTES_CSS='.markdown-style { max-width: 100% !important; } body, .markdown-style, .markdown-style *, .markdown-style code, .markdown-style pre { font-family: Arial, Helvetica, sans-serif !important; }'
+
+          markdown-to-html-cli --source /tmp/release_notes_full.md --output /tmp/release_notes.raw.html --no-dark-mode --markdown-style-theme dark --no-corners --style "$NOTES_CSS"
 
           # Remove javascript from HTML
           awk '/<script/,/<\/script>/ {next} 1' /tmp/release_notes.raw.html > /tmp/release_notes.html
@@ -103,7 +155,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Auth Google API
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
@@ -122,17 +174,14 @@ jobs:
 
             if not exist ${{ env.ROOT }}\..\obs-studio\build64_qt6\rundir\${{ env.BUILD_CONFIG }} md ${{ env.ROOT }}\..\obs-studio\build64_qt6\rundir\${{ env.BUILD_CONFIG }}
 
-            if not exist ${{ env.ROOT }}\..\obs-studio\build32_qt6\rundir\${{ env.BUILD_CONFIG }} md ${{ env.ROOT }}\..\obs-studio\build32_qt6\rundir\${{ env.BUILD_CONFIG }}
 
             if not exist ${{ env.ROOT }}\..\download md ${{ env.ROOT }}\..\download
 
             if not exist ${{ env.ROOT }}\..\download\obs-streamelements-core md ${{ env.ROOT }}\..\download\obs-streamelements-core
 
-            if not exist ${{ env.ROOT }}\..\download\obs-streamelements-core\build32_qt6 md ${{ env.ROOT }}\..\download\obs-streamelements-core\build32_qt6
 
             if not exist ${{ env.ROOT }}\..\download\obs-streamelements-core\build64_qt6 md ${{ env.ROOT }}\..\download\obs-streamelements-core\build64_qt6
 
-            if not exist ${{ env.ROOT }}\..\download\obs-streamelements\build32_qt6 md ${{ env.ROOT }}\..\download\obs-streamelements\build32_qt6
 
             if not exist ${{ env.ROOT }}\..\download\obs-streamelements\build64_qt6 md ${{ env.ROOT }}\..\download\obs-streamelements\build64_qt6
 
@@ -141,7 +190,6 @@ jobs:
 
 
 
-            curl -f https://storage.googleapis.com/se-obs-builds/obs-streamelements-core/latest/windows/build32_qt6.zip --output ${{ env.ROOT }}\..\download\obs-streamelements-core\build32_qt6.zip
 
             curl -f https://storage.googleapis.com/se-obs-builds/obs-streamelements-core/latest/windows/build64_qt6.zip --output ${{ env.ROOT }}\..\download\obs-streamelements-core\build64_qt6.zip
 
@@ -155,25 +203,21 @@ jobs:
 
 
 
-            7z x -y ${{ env.ROOT }}\..\download\obs-streamelements-core\build32_qt6.zip -o${{ env.ROOT }}\..\download\obs-streamelements-core\build32_qt6
 
             7z x -y ${{ env.ROOT }}\..\download\obs-streamelements-core\build64_qt6.zip -o${{ env.ROOT }}\..\download\obs-streamelements-core\build64_qt6
 
 
 
 
-            xcopy ${{ env.ROOT }}\..\download\obs-streamelements-core\build32_qt6\*.* ${{ env.ROOT }}\..\obs-studio\build32_qt6\rundir\${{ env.BUILD_CONFIG }} /S /E /I /Y
 
             xcopy ${{ env.ROOT }}\..\download\obs-streamelements-core\build64_qt6\*.* ${{ env.ROOT }}\..\obs-studio\build64_qt6\rundir\${{ env.BUILD_CONFIG }} /S /E /I /Y
 
-            xcopy ${{ env.ROOT }}\..\download\obs-streamelements\build32_qt6\*.* ${{ env.ROOT }}\..\obs-studio\build32_qt6\rundir\${{ env.BUILD_CONFIG }} /S /E /I /Y
 
             xcopy ${{ env.ROOT }}\..\download\obs-streamelements\build64_qt6\*.* ${{ env.ROOT }}\..\obs-studio\build64_qt6\rundir\${{ env.BUILD_CONFIG }} /S /E /I /Y
 
 
 
 
-            curl -f https://storage.googleapis.com/cdn.streamelements.com/obs/dist/obs-streamelements-set-machine-config/windows/qa/obs-streamelements-set-machine-config-32.exe --output ${{ env.ROOT }}\..\obs-studio\build32_qt6\rundir\${{ env.BUILD_CONFIG }}\obs-plugins\32bit\obs-streamelements-set-machine-config.exe
 
             curl -f https://storage.googleapis.com/cdn.streamelements.com/obs/dist/obs-streamelements-set-machine-config/windows/qa/obs-streamelements-set-machine-config-64.exe --output ${{ env.ROOT }}\..\obs-studio\build64_qt6\rundir\${{ env.BUILD_CONFIG }}\obs-plugins\64bit\obs-streamelements-set-machine-config.exe
 
@@ -239,8 +283,6 @@ jobs:
 
             $StreamElementsExe64bit = 'obs-streamelements-setup-x64.exe'
 
-            $StreamElementsExe32bit = 'obs-streamelements-setup-x86.exe'
-
 
             # One encoding object for everything: UTF-8, and $false = no BOM, ever.
             $PSDefaultParameterValues['Out-File:Encoding'] = 'utf8'
@@ -289,18 +331,28 @@ jobs:
 
             cd "${{ env.ROOT }}"
 
-            makensis /V4 /DSKIP_64BIT_CONTENT main.nsi
-
-            ren obs-streamelements-setup.exe $StreamElementsExe32bit
-
-            makensis /V4 /DSKIP_32BIT_CONTENT main.nsi
-
-            ren obs-streamelements-setup.exe $StreamElementsExe64bit
-
+            # One installer, built once (CORE-416).
+            #
+            # This used to run makensis three times: /DSKIP_64BIT_CONTENT for an x86
+            # installer, /DSKIP_32BIT_CONTENT for the x64 one, and once more bare. The
+            # x86 build was assembled from a build32_qt6.zip that nothing has produced
+            # for a long time, and deploy published the x64 exe under the 32-bit
+            # filename anyway -- so the x86 installer was already fiction.
+            #
+            # With the 32-bit content gone from main.nsi there is nothing left for
+            # /DSKIP_32BIT_CONTENT to skip, so one bare build covers both outputs.
+            # Confirmed by compiling old-with-define against new-without and diffing:
+            # the NSIS payload is identical.
+            #
+            # The -x64 copy stays because the signing, verify and upload steps below
+            # glob obs-streamelements-setup*.exe, and because build.yml republishes the
+            # x64 exe under the 32-bit filename for any legacy client still asking.
             makensis /V4 main.nsi
 
+            copy obs-streamelements-setup.exe $StreamElementsExe64bit
+
       - name: Sign Windows binaries
-        uses: azure/artifact-signing-action@v2
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
         if: ${{ env.SIGN_WINDOWS_BINARIES == 'true'}}
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -315,11 +367,26 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
-# Automatically finds signtool.exe and exposes its path
+      # Inlined from KamaranL/add-signtool-action@v1: find the newest signtool.exe
+      # for this runner's architecture under the Windows SDK and put its directory on
+      # PATH, which is all the verify step below needs. The action's `id: signtool`
+      # went with it -- nothing ever read its output. Same search the action did:
+      # recurse the SDK bin tree, keep the ones in an arch-named directory, take the
+      # highest path. Absent signtool is fatal rather than a silently unverified
+      # signature.
       - name: Find SignTool
         if: ${{ env.SIGN_WINDOWS_BINARIES == 'true'}}
-        uses: KamaranL/add-signtool-action@v1
-        id: signtool
+        shell: pwsh
+        run: |
+          $arch = $env:RUNNER_ARCH.ToLower()
+          $base = "${env:ProgramFiles(x86)}/Windows Kits/10/bin"
+          $tool = Get-ChildItem $base -Recurse -Force -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name -eq $arch } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $tool) { throw "signtool.exe ($arch) not found under $base" }
+          Write-Output "Using $($tool.FullName)"
+          $tool.Directory.FullName | Out-File $env:GITHUB_PATH -Append
 
       - name: Verify Windows binaries code signature
         if: ${{ env.SIGN_WINDOWS_BINARIES == 'true'}}
@@ -341,19 +408,29 @@ jobs:
           name: windows-manifest
           path: '${{ env.ROOT }}/obs-streamelements*.manifest'
 
+      # Uploading zero files is not an error as far as the upload action is
+      # concerned, so a glob that matches nothing reports success and quietly
+      # leaves the previous build's installer in place -- which is exactly what
+      # happened between 2026-07-29 and 2026-08-13. Fail loudly instead.
+      - name: Verify installer exists before upload
+        if: ${{ env.UPLOAD_BINARIES == 'true' }}
+        shell: cmd
+        run: |
+          dir /b "${{ env.ROOT }}\obs-streamelements-setup*.exe" || (echo No installer matched obs-streamelements-setup*.exe in "${{ env.ROOT }}" & exit /b 1)
+
       - name: Upload Binaries to Google Storage
         if: ${{ env.UPLOAD_BINARIES == 'true' }}
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
           path: ${{ env.ROOT }}
-          glob: '{obs-streamelements-setup*.exe}'
+          glob: 'obs-streamelements-setup*.exe'
           destination: 'se-obs-builds/obs-streamelements-installer/latest/windows'
 
       - name: Upload Text to Google Storage
         if: ${{ env.UPLOAD_BINARIES == 'true' }}
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
@@ -375,7 +452,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Auth Google API
-        uses: 'google-github-actions/auth@v2'
+        uses: 'google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed' # v2
         with:
           project_id: streamelements-core
           workload_identity_provider: ${{ vars.GCS_WORKLOAD_ID_PROVIDER }}
@@ -547,6 +624,24 @@ jobs:
 
           codesign --remove-signature /tmp/obs-streamelements-core.plugin
 
+          # Nested executables are signed before the bundle that contains them.
+          # Code signatures seal inside-out, so anything nested must already be
+          # signed when the enclosing bundle is sealed. --deep is retained below
+          # for any embedded frameworks, but it is deprecated by Apple and does
+          # not reliably cover nested executables -- which is precisely what
+          # sentry-crash is.
+          DAEMON=/tmp/obs-streamelements-core.plugin/Contents/MacOS/sentry-crash
+
+          if [ -f "$DAEMON" ]; then
+            echo Signing nested sentry-crash daemon...
+
+            codesign --force --options runtime --timestamp --sign "${{ secrets.CODESIGN_DEVIDAPP_IDENTITY }}" "$DAEMON"
+
+            if [ $? -ne 0 ]; then exit 1; fi
+          else
+            echo "No sentry-crash daemon in the bundle (BugSplat build); skipping."
+          fi
+
           echo Signing plugin code...
 
           codesign --force --options runtime --sign "${{ secrets.CODESIGN_DEVIDAPP_IDENTITY }}" --deep /tmp/obs-streamelements-core.plugin
@@ -558,6 +653,21 @@ jobs:
           codesign -dvv /tmp/obs-streamelements-core.plugin
 
           if [ $? -ne 0 ]; then exit 1; fi
+
+          # --strict walks nested code and fails on anything unsigned or sealed
+          # incorrectly. Without it the daemon could ship unsigned and only be
+          # caught by notarization, or worse, at launch on a user's machine.
+          echo Verifying nested code...
+
+          codesign --verify --strict --verbose=2 /tmp/obs-streamelements-core.plugin
+
+          if [ $? -ne 0 ]; then exit 1; fi
+
+          if [ -f "$DAEMON" ]; then
+            codesign --verify --strict --verbose=2 "$DAEMON"
+
+            if [ $? -ne 0 ]; then exit 1; fi
+          fi
 
       - name: Create plugin package
         run: |
@@ -642,19 +752,28 @@ jobs:
             ${{ env.ROOT }}/obs-streamelements.manifest
             ${{ env.ROOT }}/obs-streamelements.*.manifest
 
+      # See the matching comment in the windows job: a glob that matches nothing
+      # uploads nothing and still succeeds, leaving the previous build's package
+      # published under the new version's name.
+      - name: Verify package exists before upload
+        if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+        run: |
+          test -f "${{ env.ROOT }}/obs-streamelements-core.pkg" \
+            || { echo "No package at ${{ env.ROOT }}/obs-streamelements-core.pkg"; exit 1; }
+
       - name: Upload Binaries to Google Storage
         if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false
           path: ${{ env.ROOT }}
-          glob: '{obs-streamelements-core.pkg}'
+          glob: 'obs-streamelements-core.pkg'
           destination: 'se-obs-builds/obs-streamelements-installer/latest/macos'
 
       - name: Upload Text to Google Storage
         if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
-        uses: 'google-github-actions/upload-cloud-storage@v3'
+        uses: 'google-github-actions/upload-cloud-storage@6397bd7208e18d13ba2619ee21b9873edc94427a' # v3
         with:
           parent: false
           process_gcloudignore: false

@@ -21,6 +21,22 @@ StreamElementsWidgetManager::StreamElementsWidgetManager(QMainWindow *parent)
 	assert(parent);
 }
 
+//
+// Destroying a dock widget while OBSInit() is still on the stack corrupts the
+// widget tree: OBS can emit FINISHED_LOADING and EXIT from two separate
+// on_event() calls inside OBSBasic::OnFirstLoad() without ever returning to
+// its own event loop, so our widgets get built into a main window that is
+// already being dismantled and then torn down seconds later. The fault landed
+// in QWidget::~QWidget reading a child's d->parent, which pointed at neither
+// the dock nor anything live (CORE-786).
+//
+// So: only delete when OBS has demonstrably reached its own event loop.
+// Otherwise detach the dock from OBS's tree and leak it. This path is reached
+// during shutdown of a process that is exiting anyway, and a handful of leaked
+// docks is a straight trade against a crash. IsObsInitFinished() is true for
+// the entire normal lifetime of the plugin, so RemoveDockWidget() at runtime
+// still deletes and nothing accumulates.
+//
 StreamElementsWidgetManager::~StreamElementsWidgetManager()
 {
 	while (DestroyCurrentCentralWidget()) {
@@ -35,7 +51,40 @@ StreamElementsWidgetManager::~StreamElementsWidgetManager()
 		     "[obs-streamelements-core]: destroying dock widget '%s'",
 		     pair.first.c_str());
 
-		QDockWidget *dock = pair.second;
+		// pair.second is already a QPointer (see the header), so a dock
+		// destroyed behind our back -- by its QMainWindow parent during
+		// OBS teardown, or by a deleteLater() posted elsewhere -- reads
+		// back null here rather than dangling.
+		//
+		// Wrapping the raw pointer in a QPointer *here* would not work
+		// and was the gap in the first version of this fix: QPointer
+		// only tracks destructions that happen after it is constructed,
+		// so one built from an already-dangling pointer is born
+		// non-null and the guard passes (CORE-786).
+		QPointer<QDockWidget> dock = pair.second;
+
+		if (!dock) {
+			blog(LOG_INFO,
+			     "[obs-streamelements-core]: dock widget '%s' was already destroyed; skipping",
+			     pair.first.c_str());
+			continue;
+		}
+
+		if (m_parent)
+			m_parent->removeDockWidget(dock);
+
+		// Deliberately NOT draining the event queue here (CORE-777).
+		// A QApplication::sendPostedEvents() at this point dispatches
+		// any DeferredDelete already posted for this very widget,
+		// destroying it, and the delete below then runs on an
+		// already-destructed object. That aborts inside Qt, where
+		// ~QObject deletes its QObjectData through a pure virtual
+		// destructor: the second pass finds the vtable degraded to
+		// QObjectData and lands in _purecall.
+		//
+		// Draining buys nothing anyway -- ~QObject discards the events
+		// posted to the object being destroyed.
+
 		if (!dock)
 			continue;
 
@@ -46,6 +95,8 @@ StreamElementsWidgetManager::~StreamElementsWidgetManager()
 			browser->DestroyBrowser();
 			browser->RemoveVideoCompositionView();
 		}
+
+		SEDeleteDockWidgetWhenSafe(dock, pair.first.c_str(), false);
 	}
 
 	m_dockWidgets.clear();
@@ -79,7 +130,7 @@ void StreamElementsWidgetManager::PushCentralWidget(
 	//obs_frontend_set_preview_program_mode(false);
 
 	// Make sure changes take effect by draining the event queue
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	QSize prevSize = mainWindow()->centralWidget()->size();
 
@@ -90,7 +141,7 @@ void StreamElementsWidgetManager::PushCentralWidget(
 	m_parent->setCentralWidget(widget);
 
 	// Drain event queue
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	widget->setMinimumSize(0, 0);
 
@@ -134,7 +185,7 @@ bool StreamElementsWidgetManager::DestroyCurrentCentralWidget()
 			->RemoveVideoCompositionView();
 	}
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 	QSize currSize = mainWindow()->centralWidget()->size();
 
 	m_parent->setCentralWidget(m_nativeCentralWidget);
@@ -144,7 +195,7 @@ bool StreamElementsWidgetManager::DestroyCurrentCentralWidget()
 	mainWindow()->centralWidget()->setMinimumSize(currSize);
 
 	// Drain event queue
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	mainWindow()->centralWidget()->setMinimumSize(0, 0);
 
@@ -243,21 +294,45 @@ bool StreamElementsWidgetManager::AddDockWidget(
 	dock->setWindowTitle(title);
 
 	dock->setWidget(widget);
-	// Qt logs "invalid 'area' argument" for NoDockWidgetArea.
-	// Insert into a valid area first, then toggle to floating below.
-	const Qt::DockWidgetArea addArea =
-		(area == Qt::NoDockWidgetArea) ? Qt::LeftDockWidgetArea : area;
-	m_parent->addDockWidget(addArea, dock);
+
+	//
+	// Qt::NoDockWidgetArea is not a valid argument to addDockWidget()
+	// (CORE-967).
+	//
+	// checkDockWidgetArea() accepts only Left/Right/Top/Bottom; anything
+	// else is rejected with "QMainWindow::addDockWidget: invalid 'area'
+	// argument" and the function returns having done nothing. The dock is
+	// then never registered in QMainWindowLayout -- and every OBS log on a
+	// machine running this carries four of those warnings per start.
+	//
+	// What followed made it worse. setFloating(false) on a dock the layout
+	// has never heard of, whose parent is nonetheless the main window, docks
+	// it through a path that skipped addDockWidget's bookkeeping; and the
+	// event-queue drains between the two setFloating() calls dispatched
+	// arbitrary posted events -- DeferredDelete included -- in the middle of
+	// manipulating dock layout. CORE-786 established what pumping there
+	// costs.
+	//
+	// The result is a QMainWindowLayout holding a half-registered dock, and
+	// that structure is exactly what QMainWindow::restoreState() walks on
+	// the next scene-collection change. SELIVE-1Z faults there, in
+	// QLayout::totalMinimumSize, on a pure virtual.
+	//
+	// A floating dock is made by adding it to a real area and then floating
+	// it, which is the documented sequence. The requested area is still
+	// recorded as-asked, so GetDockWidgetArea() and its "floating" spelling
+	// are unchanged.
+	//
+	const Qt::DockWidgetArea placementArea =
+		area == Qt::NoDockWidgetArea ? Qt::RightDockWidgetArea : area;
+
+	m_parent->addDockWidget(placementArea, dock);
 
 	m_dockWidgets[id] = dock;
 	m_dockWidgetAreas[id] = area;
 
-	if (area == Qt::NoDockWidgetArea) {
-		dock->setFloating(false);
-		QApplication::sendPostedEvents();
+	if (area == Qt::NoDockWidgetArea)
 		dock->setFloating(true);
-		QApplication::sendPostedEvents();
-	}
 
 	std::string savedId = id;
 
@@ -336,6 +411,10 @@ bool StreamElementsWidgetManager::ShowWidgetById(const char *const id)
 
 	QDockWidget *dock = m_dockWidgets[id];
 
+	// Null when Qt destroyed the dock behind our back (CORE-786).
+	if (!dock)
+		return false;
+
 	dock->setVisible(true);
 
 	return true;
@@ -354,6 +433,10 @@ bool StreamElementsWidgetManager::SetWidgetTitleById(const char* const id,
 
 	QDockWidget *dock = m_dockWidgets[id];
 
+	// Null when Qt destroyed the dock behind our back (CORE-786).
+	if (!dock)
+		return false;
+
 	dock->setWindowTitle(QString(title));
 
 	return true;
@@ -370,6 +453,10 @@ bool StreamElementsWidgetManager::HideWidgetById(const char *const id)
 	}
 
 	QDockWidget *dock = m_dockWidgets[id];
+
+	// Null when Qt destroyed the dock behind our back (CORE-786).
+	if (!dock)
+		return false;
 
 	dock->setVisible(false);
 
@@ -432,11 +519,15 @@ bool StreamElementsWidgetManager::SetWidgetDimensionsById(const char *const id,
 
 	QDockWidget *dock = m_dockWidgets[id];
 
+	// Null when Qt destroyed the dock behind our back (CORE-786).
+	if (!dock)
+		return false;
+
 	if (!dock->isFloating() || !dock->window()) {
 		return false;
 	}
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	QSize prevMin = dock->window()->minimumSize();
 	QSize prevMax = dock->window()->maximumSize();
@@ -451,7 +542,7 @@ bool StreamElementsWidgetManager::SetWidgetDimensionsById(const char *const id,
 		dock->window()->setMaximumHeight(height);
 	}
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	dock->window()->setMinimumSize(prevMin);
 	dock->window()->setMaximumSize(prevMax);
@@ -503,14 +594,20 @@ bool StreamElementsWidgetManager::RemoveDockWidget(const char *const id)
 		return false;
 	}
 
-	QDockWidget *dock = m_dockWidgets[id];
+	QPointer<QDockWidget> dock = m_dockWidgets[id];
 
 	m_dockWidgets.erase(id);
 	m_dockWidgetAreas.erase(id);
 
-	m_parent->removeDockWidget(dock);
+	// The map entry goes either way; the widget is only touched if Qt has
+	// not already destroyed it (CORE-786).
+	if (!dock)
+		return true;
 
-	dock->deleteLater();
+	if (m_parent)
+		m_parent->removeDockWidget(dock);
+
+	SEDeleteDockWidgetWhenSafe(dock, id, true);
 
 	return true;
 }
@@ -608,6 +705,11 @@ void StreamElementsWidgetManager::DeserializeDockingWidgets(std::string &input)
 	CefRefPtr<CefValue> root = CefParseJSON(
 		CefString(input), JSON_PARSER_ALLOW_TRAILING_COMMAS);
 
+	// Null for unparsable input, and the overload below dereferences it
+	// without checking. Same defect as CORE-1601, one call frame further on.
+	if (!root.get())
+		return;
+
 	DeserializeDockingWidgets(root);
 }
 
@@ -617,9 +719,13 @@ void StreamElementsWidgetManager::SaveDockWidgetsGeometry()
 
 	m_dockWidgetSavedMinSize.clear();
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	for (auto iter : m_dockWidgets) {
+		// Null when Qt destroyed the dock behind our back (CORE-786).
+		if (!iter.second)
+			continue;
+
 		m_dockWidgetSavedMinSize[iter.first] = iter.second->size();
 	}
 }
@@ -628,29 +734,37 @@ void StreamElementsWidgetManager::RestoreDockWidgetsGeometry()
 {
 	std::lock_guard<std::recursive_mutex> guard(m_mutex);
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	std::map<std::string, QSize> maxSize;
 
 	for (auto iter : m_dockWidgetSavedMinSize) {
-		if (m_dockWidgets.count(iter.first)) {
-			maxSize[iter.first] =
-				m_dockWidgets[iter.first]->maximumSize();
+		QPointer<QDockWidget> dock;
 
-			m_dockWidgets[iter.first]->setMinimumSize(iter.second);
-			m_dockWidgets[iter.first]->setMaximumSize(iter.second);
+		if (m_dockWidgets.count(iter.first))
+			dock = m_dockWidgets[iter.first];
+
+		if (dock) {
+			maxSize[iter.first] = dock->maximumSize();
+
+			dock->setMinimumSize(iter.second);
+			dock->setMaximumSize(iter.second);
 		}
 	}
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 
 	for (auto iter : m_dockWidgetSavedMinSize) {
-		if (m_dockWidgets.count(iter.first)) {
-			m_dockWidgets[iter.first]->setMinimumSize(QSize(0, 0));
-			m_dockWidgets[iter.first]->setMaximumSize(
-				maxSize[iter.first]);
+		QPointer<QDockWidget> dock;
+
+		if (m_dockWidgets.count(iter.first))
+			dock = m_dockWidgets[iter.first];
+
+		if (dock) {
+			dock->setMinimumSize(QSize(0, 0));
+			dock->setMaximumSize(maxSize[iter.first]);
 		}
 	}
 
-	QApplication::sendPostedEvents();
+	SEDrainEventQueue();
 }

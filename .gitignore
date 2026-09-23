@@ -81,6 +81,11 @@ tags
 *.res
 *.dep
 *.zip
+# Vendored SDKs shipped as archives. deps/BugSplat.xcframework.zip is already
+# tracked -- it was force-added past the rule above, which left no trace of the
+# intent -- so both are named here explicitly.
+!deps/BugSplat.xcframework.zip
+!deps/sentry-native.zip
 *.lnk
 *.chm
 *~
@@ -130,3 +135,11 @@ github_activity_daily.png
 
 #scratch dir the release workflows write recovered notes and changelogs into
 /.release-input/
+
+# Local, machine-specific agent notes (see CLAUDE.md)
+CLAUDE.local.md
+
+# MkDocs build output (see .github/workflows/pages.yml)
+_site/
+__pycache__/
+*.pyc

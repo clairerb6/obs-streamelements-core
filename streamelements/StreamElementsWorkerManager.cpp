@@ -50,7 +50,14 @@ public:
 		m_dockWidget->setWidget(browserWidget);
 		m_dockWidget->setGeometry(QRect(rec.width() * 2, rec.height() * 2, 1920, 1080));
 
-		mainWindow->addDockWidget(Qt::LeftDockWidgetArea, m_dockWidget);
+		// Not NoDockWidgetArea: addDockWidget rejects it outright and
+		// the dock never enters QMainWindowLayout, leaving the
+		// structure restoreState walks inconsistent. Added to a real
+		// area and then floated, which is the documented way to get a
+		// floating dock. See CORE-967 and the note in
+		// StreamElementsWidgetManager::AddDockWidget.
+		mainWindow->addDockWidget(Qt::RightDockWidgetArea,
+					  m_dockWidget);
 		m_dockWidget->setFloating(true);
 
 		QTimer::singleShot(std::chrono::milliseconds(0), qApp, [this]() {
@@ -59,13 +66,26 @@ public:
 	}
 
 	~StreamElementsWorker() {
+		// Null once OBS has torn down its frontend API, which happens
+		// before our teardown whenever the plugin is destroyed from
+		// inside OBSInit (CORE-786).
 		auto mainWindow = static_cast<QMainWindow *>(
 			obs_frontend_get_main_window());
 
-		mainWindow->removeDockWidget(m_dockWidget);
-		m_dockWidget->deleteLater();
+		QPointer<QDockWidget> dock(m_dockWidget);
 
-		QApplication::sendPostedEvents();
+		m_dockWidget = nullptr;
+
+		if (!dock)
+			return;
+
+		if (mainWindow)
+			mainWindow->removeDockWidget(dock);
+
+		SEDeleteDockWidgetWhenSafe(dock, "streamelements_worker", true);
+
+		// No event pump here: draining mid-teardown is what produced
+		// CORE-777.
 	}
 
 	std::string GetUrl() { return m_url; }

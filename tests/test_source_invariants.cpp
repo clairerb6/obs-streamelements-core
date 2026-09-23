@@ -10,7 +10,12 @@
 #include "source_paths.hpp"
 
 #include <cassert>
+#include <cctype>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <vector>
+#include <algorithm>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -76,7 +81,8 @@ static void check_c4_no_self_assign_cefclientid()
 {
 	auto src = slurp("streamelements/StreamElementsApiMessageHandler.cpp");
 
-	std::regex bad(R"(context\s*->\s*cefClientId\s*=\s*context\s*->\s*cefClientId)");
+	std::regex bad(
+		R"(context\s*->\s*cefClientId\s*=\s*context\s*->\s*cefClientId)");
 	check(count_matches(src, bad) == 0,
 	      "C4: StreamElementsApiMessageHandler.cpp must not contain "
 	      "`context->cefClientId = context->cefClientId` (self-assign)");
@@ -132,10 +138,2215 @@ static void check_c10_no_duplicate_handler_setcurrentprofile()
 	std::regex reg(R"(API_HANDLER_BEGIN\(\"setCurrentProfile\"\))");
 	std::size_t count = count_matches(src, reg);
 	if (count != 1) {
-		std::fprintf(stderr,
-			     "FAIL: C10: setCurrentProfile is registered %zu time(s); expected exactly 1\n",
-			     count);
+		std::fprintf(
+			stderr,
+			"FAIL: C10: setCurrentProfile is registered %zu time(s); expected exactly 1\n",
+			count);
 		++failures;
+	}
+}
+
+// --- Menu manager must not be dereferenced unguarded in Initialize().
+//
+// Initialize() calls QApplication::sendPostedEvents() a few lines above,
+// which runs deferred deletes, frontend callbacks and any modal dialog's own
+// event loop while Initialize() is still on the stack. Observed in the field:
+// OBS held OBSInit open in its modal update dialog for minutes, and by the
+// time the next line ran m_menuManager was null. UpdateInternal then faulted
+// on a null `this` at its own `if (!m_menu)` guard -- SYNC_ACCESS() locks a
+// static mutex and touches no member, so that guard is the first read through
+// `this`, which makes the null check the crash site instead of the
+// protection.
+//
+// Minidump, pid 47436:
+//   UpdateInternal+0x54  mov rcx,[rsi+18h]  rsi=0  ->  read of 0x18
+static void check_menu_manager_update_guarded()
+{
+	auto src = slurp("streamelements/StreamElementsGlobalStateManager.cpp");
+
+	// Every occurrence must be the guarded one. Counting both forms and
+	// comparing is what distinguishes them: the call sits on its own line
+	// under the guard, so a pattern anchored on the call alone matches the
+	// guarded form too and proves nothing.
+	std::regex any_call(R"(m_menuManager->Update\(\);)");
+	std::regex guarded(
+		R"(if \(m_menuManager\)[\s]*m_menuManager->Update\(\);)");
+
+	std::size_t total = count_matches(src, any_call);
+	std::size_t safe = count_matches(src, guarded);
+
+	check(total > 0,
+	      "Initialize() must still call m_menuManager->Update(); the invariant cannot be satisfied by deleting the call");
+
+	if (total != safe) {
+		std::fprintf(
+			stderr,
+			"FAIL: %zu of %zu m_menuManager->Update() call(s) lack an if (m_menuManager) guard\n",
+			total - safe, total);
+		++failures;
+	}
+}
+
+// --- CORE-777: ~StreamElementsWidgetManager must not drain the Qt event
+// queue while tearing down its dock widgets.
+//
+// The destructor used to call QApplication::sendPostedEvents() between
+// QMainWindow::removeDockWidget() and delete. That dispatches any
+// DeferredDelete already posted for the very widget about to be deleted,
+// so the delete lands on an already-destructed object and Qt aborts in
+// _purecall -- ~QObject deletes its QObjectData through a pure virtual
+// destructor, and on the second pass the vtable has degraded to
+// QObjectData, whose slot holds _purecall.
+//
+// Draining is unnecessary: ~QObject discards events posted to the object
+// being destroyed.
+static std::string strip_line_comments(const std::string &src)
+{
+	std::string out;
+	out.reserve(src.size());
+
+	for (std::size_t i = 0; i < src.size();) {
+		if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+			while (i < src.size() && src[i] != '\n')
+				++i;
+		} else {
+			out.push_back(src[i]);
+			++i;
+		}
+	}
+
+	return out;
+}
+
+static void check_widget_manager_dtor_does_not_drain_events()
+{
+	auto src = slurp("streamelements/StreamElementsWidgetManager.cpp");
+
+	// Isolate the destructor body: from its signature to the first
+	// closing brace in column 0. Scanning the whole file would trip over
+	// the deliberate drains in PushCentralWidget() and friends.
+	const std::string sig =
+		"StreamElementsWidgetManager::~StreamElementsWidgetManager()";
+
+	auto start = src.find(sig);
+	check(start != std::string::npos,
+	      "CORE-777: ~StreamElementsWidgetManager() not found -- update this invariant");
+	if (start == std::string::npos)
+		return;
+
+	auto end = src.find("\n}", start);
+	check(end != std::string::npos,
+	      "CORE-777: could not find the end of ~StreamElementsWidgetManager()");
+	if (end == std::string::npos)
+		return;
+
+	std::string body = src.substr(start, end - start);
+
+	// Comments are stripped first: the fix leaves a comment naming the
+	// call it must not make, and that must not satisfy the check either
+	// way round.
+	std::string code = strip_line_comments(body);
+
+	check(code.find("sendPostedEvents") == std::string::npos,
+	      "CORE-777: ~StreamElementsWidgetManager() must not call QApplication::sendPostedEvents() -- it turns a pending deleteLater() into a double delete");
+
+	// And the widget must be reached through a QPointer, so a dock
+	// destroyed behind our back reads back as null rather than dangling.
+	check(code.find("QPointer<QDockWidget>") != std::string::npos,
+	      "CORE-777: ~StreamElementsWidgetManager() must hold each dock widget in a QPointer before deleting it");
+}
+
+// --- CORE-786: the widget maps must hold QPointer, not raw pointers.
+//
+// Docks are children of the OBS main window (addDockWidget), and browser
+// widgets are children of their dock. Qt owns both and destroys them with
+// their parent -- which, on the OBSInit re-entrancy path, happens before
+// ~StreamElementsWidgetManager runs. Raw pointers in these maps went stale
+// and were then deleted a second time.
+//
+// Guarding at the point of use is not enough and was the gap in the first
+// version of this fix: a QPointer constructed from an already-dangling raw
+// pointer is born non-null. The map itself has to hold the QPointer.
+static void check_widget_maps_hold_qpointer()
+{
+	auto wm = strip_line_comments(
+		slurp("streamelements/StreamElementsWidgetManager.hpp"));
+
+	check(wm.find("std::map<std::string, QPointer<QDockWidget>>") !=
+		      std::string::npos,
+	      "CORE-786: m_dockWidgets must be std::map<std::string, QPointer<QDockWidget>>");
+	check(wm.find("std::map<std::string, QDockWidget*>") ==
+		      std::string::npos,
+	      "CORE-786: m_dockWidgets must not hold raw QDockWidget*");
+
+	auto bwm = strip_line_comments(
+		slurp("streamelements/StreamElementsBrowserWidgetManager.hpp"));
+
+	check(bwm.find("QPointer<StreamElementsBrowserWidget>>") !=
+		      std::string::npos,
+	      "CORE-786: m_browserWidgets must hold QPointer<StreamElementsBrowserWidget>");
+	check(bwm.find("std::map<std::string, StreamElementsBrowserWidget*>") ==
+		      std::string::npos,
+	      "CORE-786: m_browserWidgets must not hold raw StreamElementsBrowserWidget*");
+
+	// The composition view widgets are hand-deleted, so they must be
+	// QPointer too or the delete can run twice.
+	auto bw = strip_line_comments(
+		slurp("streamelements/StreamElementsBrowserWidget.hpp"));
+
+	check(bw.find("QPointer<QWidget> m_activeVideoCompositionViewWidgetContainer") !=
+		      std::string::npos,
+	      "CORE-786: m_activeVideoCompositionViewWidgetContainer must be a QPointer");
+	check(bw.find("QPointer<StreamElementsVideoCompositionViewWidget>") !=
+		      std::string::npos,
+	      "CORE-786: m_activeVideoCompositionViewWidget must be a QPointer");
+}
+
+// --- CORE-786: every event pump must go through SEDrainEventQueue().
+//
+// One choke point for every event pump the plug-in runs. A bare
+// QApplication::sendPostedEvents() is how OBS's modal update dialog and its
+// queued close() get dispatched from inside our own Initialize().
+//
+// IsObsInitFinished() distinguishes OBS's own event loop from a nested one by
+// counting the pumps we run ourselves. A bare QApplication::sendPostedEvents()
+// anywhere in the plugin is invisible to that counter, so the gate could open
+// while OBSInit() is still on the stack -- which is the exact condition that
+// corrupts the widget tree. The wrapper in StreamElementsUtils.cpp is the only
+// legitimate caller.
+static void check_event_pumps_are_counted()
+{
+	static const char *const kSources[] = {
+		"streamelements/StreamElementsBrowserWidgetManager.cpp",
+		"streamelements/StreamElementsGlobalStateManager.cpp",
+		"streamelements/StreamElementsNativeOBSControlsManager.cpp",
+		"streamelements/StreamElementsWidgetManager.cpp",
+		"streamelements/StreamElementsWorkerManager.cpp",
+		"streamelements/StreamElementsReportIssueDialog.cpp",
+	};
+
+	for (const char *const relpath : kSources) {
+		auto code = strip_line_comments(slurp(relpath));
+
+		if (code.find("sendPostedEvents") != std::string::npos) {
+			std::fprintf(
+				stderr,
+				"FAIL: CORE-786: %s calls sendPostedEvents() directly; use SEDrainEventQueue() so the pump is counted\n",
+				relpath);
+			++failures;
+		}
+	}
+
+	// And the wrapper itself must still contain exactly one real pump.
+	auto utils = strip_line_comments(
+		slurp("streamelements/StreamElementsUtils.cpp"));
+
+	std::regex pump(R"(QApplication::sendPostedEvents\(\);)");
+
+	check(count_matches(utils, pump) == 1,
+	      "CORE-786: StreamElementsUtils.cpp must contain exactly one QApplication::sendPostedEvents(), inside SEDrainEventQueue()");
+
+	check(utils.find("void SEDrainEventQueue()") != std::string::npos,
+	      "CORE-786: SEDrainEventQueue() must exist in StreamElementsUtils.cpp");
+
+	// The pump must stop once the close has been caught: every further
+	// dispatch feeds events into a world that is being torn down.
+	auto pump_at = utils.find("void SEDrainEventQueue()");
+	auto pump_end = utils.find("\n}", pump_at);
+	auto pump_body = utils.substr(pump_at, pump_end - pump_at);
+
+	check(pump_body.find("SEIsEventPumpAllowed()") != std::string::npos,
+	      "CORE-786: SEDrainEventQueue() must gate on SEIsEventPumpAllowed()");
+}
+
+// --- CORE-786: dock widgets must not be deleted unguarded.
+static void check_dock_deletion_is_gated()
+{
+	// Every dock teardown site must go through the shared helper.
+	static const char *const kSources[] = {
+		"streamelements/StreamElementsWidgetManager.cpp",
+		"streamelements/StreamElementsWorkerManager.cpp",
+	};
+
+	for (const char *const relpath : kSources) {
+		auto s = strip_line_comments(slurp(relpath));
+
+		if (s.find("SEDeleteDockWidgetWhenSafe") == std::string::npos) {
+			std::fprintf(
+				stderr,
+				"FAIL: CORE-786: %s must destroy dock widgets through SEDeleteDockWidgetWhenSafe()\n",
+				relpath);
+			++failures;
+		}
+	}
+
+	auto utils = strip_line_comments(
+		slurp("streamelements/StreamElementsUtils.cpp"));
+
+	check(utils.find("SEIsUiTeardownSafe()") != std::string::npos,
+	      "CORE-786: SEDeleteDockWidgetWhenSafe() must gate on SEIsUiTeardownSafe()");
+
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsWidgetManager.cpp"));
+
+	// The two raw deletion forms are legitimate inside the helper and
+	// nowhere else, so cut the helper out before looking for them.
+	check(code.find("delete dock.data();") == std::string::npos,
+	      "CORE-786: bare `delete dock.data();` outside SafeDeleteDockWidget()");
+	check(code.find("dock->deleteLater();") == std::string::npos,
+	      "CORE-786: bare `dock->deleteLater();` outside SafeDeleteDockWidget()");
+}
+
+// --- CORE-786: the plug-in must watch the OBS main window for close.
+//
+// OBSBasic::OBSInit() starts AutoUpdateThread before it emits
+// FINISHED_LOADING, and that thread ends with a queued close() on the main
+// window. If the close lands before Initialize() finishes, our object graph is
+// half-built and must not be torn down. QEvent::Close on the main window is
+// the signal; it is delivered before OBSBasic::closeEvent(), which is what
+// fires EXIT.
+static void check_obs_close_is_watched()
+{
+	auto code = strip_line_comments(
+		slurp("obs-streamelements-core-plugin.cpp"));
+
+	check(code.find("QEvent::Close") != std::string::npos,
+	      "CORE-786: the plug-in must watch for QEvent::Close on the OBS main window");
+
+	check(code.find("installEventFilter") != std::string::npos,
+	      "CORE-786: the close watcher must be installed as an event filter");
+
+	check(code.find("bool SEIsUiTeardownSafe()") != std::string::npos,
+	      "CORE-786: SEIsUiTeardownSafe() must be defined in the plug-in entry point");
+
+	check(code.find("SENoteInitializeCompleted()") != std::string::npos,
+	      "CORE-786: SENoteInitializeCompleted() must be defined in the plug-in entry point");
+
+	// Pumping the event queue anywhere under Initialize() is what nests
+	// OBS's EXIT dispatch inside its FINISHED_LOADING dispatch, so the
+	// whole call has to run with pumping disabled.
+	check(code.find("bool SEIsEventPumpAllowed()") != std::string::npos,
+	      "CORE-786: SEIsEventPumpAllowed() must be defined in the plug-in entry point");
+
+	check(code.find("s_initializeInProgress") != std::string::npos,
+	      "CORE-786: an in-progress flag must cover the whole of Initialize()");
+
+	check(code.find("StreamElementsInitializeScope initializeScope;") !=
+		      std::string::npos,
+	      "CORE-786: Initialize() must be called inside StreamElementsInitializeScope");
+
+	// The gate has to actually be consulted on the teardown path, and the
+	// unsafe branch must leak rather than destroy.
+	check(code.find("StreamElementsGlobalStateManager::Leak()") !=
+		      std::string::npos,
+	      "CORE-786: the EXIT path must leak rather than tear down when teardown is unsafe");
+
+	// Removing our callback mutates the vector OBSStudioAPI::on_event() is
+	// iterating. Harmless normally, fatal when EXIT is dispatched from
+	// inside another on_event(), so it must be gated.
+	auto rm = code.find("obs_frontend_remove_event_callback(");
+	check(rm != std::string::npos,
+	      "CORE-786: EXIT-path callback removal not found -- update this invariant");
+	if (rm != std::string::npos) {
+		auto before = code.rfind("SEIsUiTeardownSafe()", rm);
+		check(before != std::string::npos && rm - before < 200,
+		      "CORE-786: obs_frontend_remove_event_callback() must be gated on SEIsUiTeardownSafe()");
+	}
+
+	// The filter must never swallow the event -- OBS has to close exactly
+	// as it would without us.
+	check(code.find("return QObject::eventFilter(watched, event);") !=
+		      std::string::npos,
+	      "CORE-786: the close watcher must not consume events");
+
+	// And Initialize() must record completion, or the gate never opens.
+	auto gsm = strip_line_comments(
+		slurp("streamelements/StreamElementsGlobalStateManager.cpp"));
+
+	check(gsm.find("SENoteInitializeCompleted();") != std::string::npos,
+	      "CORE-786: Initialize() must call SENoteInitializeCompleted() on completion");
+}
+
+// --- CORE-860: both of sentry's crash entry points must be ours.
+//
+// sentry_init() installs a top-level SEH filter AND a signal(SIGABRT, ...)
+// handler. Owning only the first sent every abort() -- every _purecall, so the
+// whole double-destruction family -- straight to Sentry with no consent prompt,
+// no module-of-interest gate and no payload.
+static void check_both_sentry_doors_are_owned()
+{
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsSentryCrashHandler.cpp"));
+
+	check(code.find("SetUnhandledExceptionFilter(SentryExceptionFilter)") !=
+		      std::string::npos,
+	      "CORE-860: the SEH filter must still be installed");
+
+	check(code.find("signal(SIGABRT,") != std::string::npos,
+	      "CORE-860: the SIGABRT door must be taken too, or abort() bypasses the gate and the consent prompt");
+
+	check(code.find("_set_purecall_handler(") != std::string::npos,
+	      "CORE-860: a pure virtual call must be identified as such, not arrive as an anonymous abort");
+
+	// Both doors must funnel into the same path, or the gate and the
+	// consent prompt exist on only one of them.
+	check(count_matches(code, std::regex("HandleFatalException\\(")) >= 3,
+	      "CORE-860: both entry points must call the shared HandleFatalException()");
+
+	// The SEH path takes its CONTEXT from the OS at the fault point; the
+	// abort path captures its own, from inside our handler. Only the latter
+	// may drop leading frames -- see check_abort_path_drops_own_frames.
+	check(code.find("HandleFatalException(pExceptionInfo, false)") !=
+		      std::string::npos,
+	      "CORE-860: the SEH path must NOT skip leading frames");
+
+	check(code.find("HandleFatalException(&pointers, true)") !=
+		      std::string::npos,
+	      "CORE-860: the abort path MUST skip its own leading frames");
+
+	// Identity has to survive a future bypass of the crash path.
+	check(code.find("ArmStableSentryTags();") != std::string::npos,
+	      "CORE-860: the stable identity tags must be armed at init, not only on the crash path");
+}
+
+// --- CORE-860: the abort path must not rubber-stamp the gate.
+//
+// The SIGABRT handler captures its own CONTEXT, so this plug-in is on the stack
+// of every abort in the process. Without dropping those leading frames, the
+// module-of-interest verdict is true for everyone's crashes.
+static void check_abort_path_drops_own_frames()
+{
+	auto hpp = strip_line_comments(
+		slurp("streamelements/StreamElementsCrashContext.hpp"));
+
+	check(hpp.find("bool skipOwnLeadingFrames") != std::string::npos,
+	      "CORE-860: WalkStack() must offer the leading-frame skip");
+
+	auto cpp = strip_line_comments(
+		slurp("streamelements/StreamElementsCrashContext.cpp"));
+
+	check(cpp.find("SetSkipLeadingOwnFrames(skipOwnLeadingFrames)") !=
+		      std::string::npos,
+	      "CORE-860: WalkStack() must pass the skip flag through to the walker");
+
+	// The skip must run before the frame is recorded and before the verdict
+	// is taken, and must stop at the first frame that is not ours.
+	auto skip = cpp.find("if (m_skippingOwnFrames) {");
+	check(skip != std::string::npos,
+	      "CORE-860: the walker must implement the leading-frame skip");
+
+	if (skip != std::string::npos) {
+		auto verdict = cpp.find("hasMatchModuleOfInterest =", skip);
+		check(verdict != std::string::npos && verdict > skip,
+		      "CORE-860: the skip must be applied before the module-of-interest verdict");
+
+		auto stops = cpp.find("m_skippingOwnFrames = false;", skip);
+		check(stops != std::string::npos && stops - skip < 200,
+		      "CORE-860: skipping must stop at the first frame that is not ours");
+	}
+}
+
+// --- CORE-861: a failing sentry_init() must say why, and must not depend on
+// the process working directory.
+//
+// Every way sentry_init() can fail logs through SENTRY_WARN, which is compiled
+// in but discarded unless options->debug is set. Without the logger installed,
+// an install with no crash reporting at all produced one line -- "sentry_init()
+// failed" -- and no way to find out why.
+//
+// Separately, obs_module_config_path() is relative on a portable install, and a
+// relative path handed to sentry is resolved against the process working
+// directory, which no plug-in controls.
+static void check_sentry_init_is_diagnosable()
+{
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsSentryCrashHandler.cpp"));
+
+	check(code.find("sentry_options_set_logger(") != std::string::npos,
+	      "CORE-861: sentry's own diagnostics must be routed into the OBS log");
+
+	// The logger is inert unless debug is enabled -- that is the whole
+	// reason the failures were invisible.
+	check(code.find("sentry_options_set_debug(options, 1)") !=
+		      std::string::npos,
+	      "CORE-861: sentry debug must be on, or the logger above is never called");
+
+	// ...but the default level must stay above DEBUG, or every start-up
+	// writes a wall of SDK chatter into the user's log.
+	check(code.find("sentry_options_set_logger_level(") !=
+		      std::string::npos,
+	      "CORE-861: the logger level must be set, or the default DEBUG stream floods the log");
+
+	check(code.find("SENTRY_LEVEL_WARNING") != std::string::npos,
+	      "CORE-861: the default logger level must be WARNING so failures still explain themselves");
+
+	// The database path must not be left relative.
+	//
+	// Anchored on the call expression, not on the name: the function's own
+	// definition contains the name too, so a bare find() still matches
+	// after the call site is removed and proves nothing.
+	std::regex resolvesConfigPath(
+		R"(ResolveAgainstHostExecutable\(\s*utf8_to_wstring\(databasePath\)\s*\))");
+	check(count_matches(code, resolvesConfigPath) == 1,
+	      "CORE-861: the config path handed to sentry must go through ResolveAgainstHostExecutable()");
+
+	// The resolved value, not the raw one, is what sentry must receive.
+	std::regex setsResolved(
+		R"(sentry_options_set_database_pathw\(\s*options,\s*resolved\.c_str\(\))");
+	check(count_matches(code, setsResolved) == 1,
+	      "CORE-861: sentry_options_set_database_pathw() must be given the resolved path");
+
+	// And the MAX_PATH ceiling must be reported rather than left as a silent
+	// absence of crash reports. Anchored on the emitted message, so that
+	// deleting the blog() is what fails -- renaming the constant is not.
+	std::regex warnsOnLimit(
+		R"(blog\(LOG_WARNING[\s\S]{0,400}?MAX_PATH limit of)");
+	check(count_matches(code, warnsOnLimit) >= 1,
+	      "CORE-861: a database path too close to MAX_PATH must be warned about explicitly");
+
+	check(code.find(
+		      "resolved.size() + kLongestSentryChildPath >= MAX_PATH") !=
+		      std::string::npos,
+	      "CORE-861: the MAX_PATH check must account for the files sentry creates inside the database directory, not just the directory itself");
+}
+
+// --- CORE-862: queued Qt tasks must not run once crash reporting has begun.
+//
+// The consent prompt is a native Win32 modal dialog, and every Win32 modal loop
+// dispatches the private message Qt's event dispatcher uses to drain its
+// posted-event queue. So putting the prompt up runs whatever was queued -- and a
+// task that calls QDialog::exec() blocks the crash path behind an unrelated
+// modal dialog.
+static void check_queued_tasks_suppressed_during_crash()
+{
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsUtils.cpp"));
+
+	// Both queued paths -- QtPostTask's executor and QtDelayTask's timer
+	// lambda -- must skip the task AND release the waiter. Dropping a task
+	// without calling finish() does not remove the deadlock, it moves it
+	// onto whichever thread called QtExecSync and is blocked in
+	// result.wait().
+	std::regex gateReleasesWaiter(
+		R"(if \(IsCrashReportingInProgress\(\)\)\s*\{\s*finish\(\);\s*return;)");
+	check(count_matches(code, gateReleasesWaiter) == 2,
+	      "CORE-862: both queued paths must call finish() before returning, or a QtExecSync caller is left blocked forever");
+
+	// The same-thread QtExecSync shortcut bypasses the queue entirely and
+	// runs the task inline, so it needs its own gate -- and the crashing
+	// thread is usually this one. Negated form, hence a separate check.
+	std::regex execSyncGated(
+		R"(if \(!IsCrashReportingInProgress\(\)\)\s*task\(\);)");
+	check(count_matches(code, execSyncGated) == 1,
+	      "CORE-862: the QtExecSync same-thread path must be gated too -- it never touches the queue");
+
+	// A dropped task must not be reported as having run: the gate has to sit
+	// above the running flag, not below it.
+	auto gate = code.find("if (IsCrashReportingInProgress())");
+	auto running = code.find("item->running = true;");
+	check(gate != std::string::npos && running != std::string::npos &&
+		      gate < running,
+	      "CORE-862: the crash gate must precede item->running, or dropped tasks appear as running in async-context.json");
+}
+
+// --- CORE-863: the allocation door must be owned, chained, and not seized.
+//
+// BugSplat installed five process-global CRT hooks; the Sentry migration
+// dropped all five and CORE-860 recovered two. This is the allocation one.
+//
+// The design constraint is as important as the hook itself: BugSplat's
+// memory_depleted() force-crashes on any allocation failure, which would
+// preempt libobs's own bmalloc -> bcrash handling. Ours observes and chains.
+static void check_oom_handler_observes_and_chains()
+{
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsSentryCrashHandler.cpp"));
+
+	check(code.find("_set_new_handler(SentryNewHandler)") !=
+		      std::string::npos,
+	      "CORE-863: the allocation door must be taken, or an OOM is reported as a generic abort at best");
+
+	// malloc failures must route through it too -- libobs allocates through
+	// bmalloc -> malloc, which is the largest allocator in the process.
+	check(code.find("_set_new_mode(1)") != std::string::npos,
+	      "CORE-863: _set_new_mode(1) must route malloc failures through the handler as well");
+
+	// The displaced handler must be kept and called: an upstream handler
+	// that can free memory and ask for a retry has to still win.
+	check(code.find("s_previousNewHandler = _set_new_handler(") !=
+		      std::string::npos,
+	      "CORE-863: the displaced new handler must be captured for chaining");
+
+	std::regex chains(
+		R"(if \(s_previousNewHandler\)\s*return s_previousNewHandler\(size\);)");
+	check(count_matches(code, chains) == 1,
+	      "CORE-863: the handler must chain and pass the upstream answer through, not swallow a retry request");
+
+	// And it must otherwise return 0 -- that is what preserves standard
+	// semantics (bad_alloc thrown, malloc returns NULL) rather than seizing
+	// the host's policy the way BugSplat's terminator() did.
+	auto handler = code.find("int __cdecl SentryNewHandler(size_t size)");
+	check(handler != std::string::npos,
+	      "CORE-863: SentryNewHandler not found -- update this invariant");
+
+	if (handler != std::string::npos) {
+		auto body = code.substr(handler, 700);
+
+		check(body.find("return 0;") != std::string::npos,
+		      "CORE-863: the handler must return 0 when nothing upstream can help, so operator new still throws and malloc still returns NULL");
+
+		check(body.find("terminator") == std::string::npos &&
+			      body.find("TerminateProcess") ==
+				      std::string::npos,
+		      "CORE-863: the handler must NOT force-crash the process -- that would preempt libobs's own bmalloc failure handling");
+
+		// The guard buffer exists for exactly this moment.
+		check(body.find("ReleaseGuardBuffer();") != std::string::npos,
+		      "CORE-863: the new handler must hand the guard buffer back at the moment memory ran out");
+	}
+
+	// crash.kind precedence: a sticky, inferred OOM flag must not relabel a
+	// definite, proximate purecall.
+	std::regex kindPrecedence(
+		R"(s_abortIsPurecall\s*\?\s*"purecall"\s*:\s*s_sawOutOfMemory\s*\?\s*"oom"\s*:\s*fromAbortDoor\s*\?\s*"abort"\s*:\s*"exception")");
+	check(count_matches(code, kindPrecedence) == 1,
+	      "CORE-863: crash.kind must rank purecall above the sticky OOM flag, OOM above a bare abort, and distinguish the two doors");
+
+	// And it must be set on the SHARED path, not in the abort handler.
+	// An uncaught std::bad_alloc never reaches abort() on MSVC -- `throw`
+	// raises a real SEH exception (0xE06D7363), so it lands in the filter.
+	// Tagging only in the abort handler left the OOM this exists for
+	// untagged, which a test run caught.
+	auto shared = code.find(
+		"static LONG HandleFatalException(PEXCEPTION_POINTERS pExceptionInfo,");
+	auto tag = code.find("sentry_set_tag(\"crash.kind\", kind);");
+	auto abortDoor = code.find("static void __cdecl SentryAbortHandler(");
+
+	check(shared != std::string::npos && tag != std::string::npos &&
+		      abortDoor != std::string::npos,
+	      "CORE-863: crash.kind wiring not found -- update this invariant");
+
+	if (shared != std::string::npos && tag != std::string::npos &&
+	    abortDoor != std::string::npos) {
+		check(tag > shared && tag < abortDoor,
+		      "CORE-863: crash.kind must be set on the shared crash path, not only in the abort handler -- an uncaught bad_alloc arrives through the SEH filter");
+	}
+}
+
+// --- CORE-863: the guard buffer must be released before anything allocates.
+//
+// It is reserved so that collection has headroom on an exhausted process. It
+// used to be handed back on the first line of Collect(), which runs after the
+// stack walk and after the consent prompt -- both of which allocate.
+static void check_guard_buffer_released_first()
+{
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsSentryCrashHandler.cpp"));
+
+	auto entry = code.find(
+		"static LONG HandleFatalException(PEXCEPTION_POINTERS pExceptionInfo,");
+	check(entry != std::string::npos,
+	      "CORE-863: HandleFatalException not found -- update this invariant");
+
+	if (entry == std::string::npos)
+		return;
+
+	auto release = code.find(
+		"StreamElementsCrashContext::ReleaseGuardBuffer();", entry);
+	auto walk = code.find("WalkStack(", entry);
+
+	check(release != std::string::npos,
+	      "CORE-863: the crash path must release the guard buffer");
+	check(walk != std::string::npos,
+	      "CORE-863: WalkStack call not found -- update this invariant");
+
+	if (release != std::string::npos && walk != std::string::npos) {
+		check(release < walk,
+		      "CORE-863: the guard buffer must be released BEFORE the stack walk, which allocates");
+	}
+}
+
+// --- CORE-862: the consent prompt must be bounded.
+//
+// The choke point in __QtPostTask_Impl stops OUR queued work from opening a
+// modal dialog inside the prompt. It cannot stop OBS's own posted calls or
+// another plug-in's, and nothing can -- a nested modal loop is above us on the
+// stack and no other thread can unwind it. So the prompt needs a deadline, or a
+// crashed process can sit there indefinitely holding the user's machine.
+static void check_consent_prompt_is_bounded()
+{
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsSentryCrashHandler.cpp"));
+
+	check(code.find("CRASH_PROMPT_DEADLINE_MS") != std::string::npos,
+	      "CORE-862: the consent prompt must have a deadline");
+
+	// Armed immediately before the prompt and released immediately after --
+	// scoped to the prompt alone, because everything after it is already
+	// bounded and a watchdog spanning the upload would have to outlast it.
+	auto arm = code.find("ArmPromptWatchdog();");
+	auto prompt = code.find("StreamElementsCrashConsentDialog::Prompt(");
+	auto disarm = code.find("DisarmPromptWatchdog();");
+
+	check(arm != std::string::npos && prompt != std::string::npos &&
+		      disarm != std::string::npos,
+	      "CORE-862: prompt watchdog wiring not found -- update this invariant");
+
+	if (arm != std::string::npos && prompt != std::string::npos &&
+	    disarm != std::string::npos) {
+		check(arm < prompt,
+		      "CORE-862: the watchdog must be armed BEFORE the prompt, or it cannot bound it");
+		check(disarm > prompt,
+		      "CORE-862: the watchdog must be released AFTER the prompt returns");
+	}
+
+	// TerminateProcess, not exit() and not abort(): both run code on the way
+	// out, and abort() would re-enter our own SIGABRT handler.
+	auto watchdog = code.find("PromptWatchdogThreadProc");
+	check(watchdog != std::string::npos,
+	      "CORE-862: watchdog thread proc not found -- update this invariant");
+
+	if (watchdog != std::string::npos) {
+		auto body = code.substr(watchdog, 900);
+
+		check(body.find("TerminateProcess") != std::string::npos,
+		      "CORE-862: the watchdog must terminate the process when the deadline passes");
+		check(body.find("abort()") == std::string::npos &&
+			      body.find("exit(") == std::string::npos,
+		      "CORE-862: the watchdog must not use abort() or exit() -- abort() re-enters our own SIGABRT handler");
+	}
+}
+
+// --- CORE-865: the encoder must be released once per OBJECT, not per consumer.
+//
+// AddConsumer acquires inside `if (!m_object)` -- once, for the first consumer.
+// RemoveConsumer used to release unconditionally, above the guard, so N
+// consumers produced one acquire and N releases. Several providers share one
+// obs_encoder_t, so the second consumer to leave destroyed an encoder the
+// others were still holding, and the next release wrote through freed memory.
+static void check_encoder_released_once_per_object()
+{
+	auto code = strip_line_comments(
+		slurp("streamelements/StreamElementsUtils.hpp"));
+
+	auto remove = code.find("void RemoveConsumer()");
+	check(remove != std::string::npos,
+	      "CORE-865: RemoveConsumer not found -- update this invariant");
+
+	if (remove == std::string::npos)
+		return;
+
+	auto body = code.substr(remove, 900);
+
+	auto guard = body.find("if (m_refCount <= 0 && m_object)");
+	auto release = body.find("ReleaseRef(m_object);");
+
+	check(guard != std::string::npos,
+	      "CORE-865: the last-consumer guard must remain");
+	check(release != std::string::npos,
+	      "CORE-865: RemoveConsumer must still release the encoder");
+
+	if (guard != std::string::npos && release != std::string::npos) {
+		check(release > guard,
+		      "CORE-865: ReleaseRef must sit INSIDE the m_refCount <= 0 branch -- releasing once per consumer destroys an encoder other consumers still hold");
+	}
+
+	// And exactly one release site, so the guarded one cannot be joined by an
+	// unguarded one later.
+	check(count_matches(code, std::regex(R"(ReleaseRef\(m_object\);)")) ==
+		      1,
+	      "CORE-865: there must be exactly one ReleaseRef(m_object) call site");
+
+	// The acquire stays guarded too; the whole point is that the two match.
+	auto add = code.find("void AddConsumer()");
+	if (add != std::string::npos) {
+		auto addBody = code.substr(add, 500);
+		check(addBody.find("if (!m_object)") != std::string::npos,
+		      "CORE-865: AddConsumer must still acquire only for the first consumer");
+	}
+}
+
+
+// --- CORE-864: sentry-wer.dll must never be installed next to obs64.exe.
+//
+// sentry_backend_native.c's wer_default_path() joins "sentry-wer.dll" onto the
+// directory of the HOST EXECUTABLE and registers whatever it finds. A copy in
+// bin\64bit would therefore be registered by sentry itself -- and sentry's
+// module claims every fast-fail and every heap corruption in the process, OBS's
+// own and every other plug-in's, with no module-of-interest gate and no consent.
+//
+// That is the entire CORE-860 decision, silently undone for one crash class, by
+// a one-line change to a copy rule. Both the CMake copy and the installer put
+// it in obs-plugins\64bit precisely so sentry does NOT find it, and ours stays
+// the only registered module.
+static void check_sentry_wer_is_not_beside_the_host_executable()
+{
+	auto cmake = slurp("CMakeLists.txt");
+
+	// Isolate the rule that copies the two WER modules, and assert about ITS
+	// destinations. Searching the whole file would prove nothing: the file
+	// mentions bin/<BITS>bit legitimately, for the BugSplat runtime.
+	auto copyRule = cmake.find("foreach(se_wer_target");
+
+	check(copyRule != std::string::npos,
+	      "CORE-864: both WER modules must be copied beside the plug-in, or the gating module has nothing to forward to");
+
+	if (copyRule != std::string::npos) {
+		auto ruleEnd = cmake.find("endforeach()", copyRule);
+		auto rule = cmake.substr(copyRule, ruleEnd - copyRule);
+
+		check(rule.find("obs-plugins/${BITS}bit") != std::string::npos,
+		      "CORE-864: the WER modules must be copied into obs-plugins/<BITS>bit, where the handler resolves them");
+
+		// The one that matters. bin/<BITS>bit is the host executable's
+		// directory, which is exactly where sentry looks.
+		check(rule.find("/bin/${BITS}bit") == std::string::npos,
+		      "CORE-864: the WER modules must NOT be copied into bin/<BITS>bit -- sentry would register sentry-wer.dll itself, ungated and unconsented");
+	}
+
+	auto nsi = slurp("CI/obs-streamelements-installer/main.nsi");
+
+	check(nsi.find("obs-plugins\\64bit\\sentry-wer.dll") !=
+			      std::string::npos ||
+		      nsi.find("64bit\\sentry-wer.dll") != std::string::npos,
+	      "CORE-864: the installer must package sentry-wer.dll from obs-plugins\\64bit");
+
+	check(nsi.find("bin\\64bit\\sentry-wer.dll") == std::string::npos,
+	      "CORE-864: the installer must NOT place sentry-wer.dll in bin\\64bit, where sentry would register it ungated");
+
+	check(nsi.find("se-crash-wer.dll") != std::string::npos,
+	      "CORE-864: the installer must package se-crash-wer.dll, the gating module");
+}
+
+// --- CORE-864: the WER module must gate before it forwards.
+//
+// It runs in WerFault.exe with no way to ask anything. If it forwarded first
+// and gated afterwards there would be nothing to undo -- sentry's module hands
+// the crash to the daemon, which writes and uploads it.
+static void check_wer_module_gates_before_forwarding()
+{
+	auto code = slurp("streamelements/StreamElementsWerModule.cpp");
+
+	// Anchored on the CALL SITES, never on the definitions. A check that
+	// matched "static BOOL SEWerStackTouchesModuleOfInterest(" would still
+	// pass with the call deleted, which is precisely the regression it is
+	// meant to catch.
+	auto walk = code.find("!SEWerStackTouchesModuleOfInterest(");
+	auto forward = code.find("return SEWerForwardToSentry(");
+
+	check(walk != std::string::npos,
+	      "CORE-864: the module must walk the crashed stack");
+	check(forward != std::string::npos,
+	      "CORE-864: the module must forward to sentry's module");
+
+	if (walk != std::string::npos && forward != std::string::npos) {
+		check(walk < forward,
+		      "CORE-864: the gate must run before the forward -- once sentry's module has the crash, it is reported");
+	}
+
+	// Ownership is sentry's verdict, never ours. Claiming a crash sentry
+	// will not report suppresses WER's own handling and reports nothing.
+	check(code.find("*ownershipClaimed = TRUE") == std::string::npos,
+	      "CORE-864: the module must never claim ownership on its own account; it propagates whatever sentry's module decided");
+}
+
+// --- CORE-864: the prompt must disclose the reports it cannot ask about.
+//
+// Heap corruption and fast-fail are reported without any prior answer, because
+// there is no moment at which they could ask for one. A user is entitled to
+// know that, and to know how much smaller that payload is than the one this
+// dialog is about. The disclosure is the only place either is said.
+static void check_prompt_discloses_automatic_reports()
+{
+	auto dialog =
+		slurp("streamelements/StreamElementsCrashConsentDialog.cpp");
+
+	// Anchored on the AddControl that DISPLAYS it, not on the string's
+	// definition -- a dialog that defines the text and never shows it would
+	// otherwise pass while telling the user nothing.
+	check(dialog.find("ATOM_STATIC, AUTOMATIC_REPORT_TEXT") !=
+		      std::string::npos,
+	      "CORE-864: the consent dialog must display the automatic-report disclosure, not merely define it");
+
+	// And the disclosure has to stay true. It promises those reports carry
+	// no configuration archive and no screenshot, which holds only because
+	// the WER module never collects a payload.
+	auto module = slurp("streamelements/StreamElementsWerModule.cpp");
+
+	check(module.find("Collect(") == std::string::npos,
+	      "CORE-864: the WER module must not collect a payload -- the prompt tells the user these reports carry none");
+}
+
+// --- CORE-864: the registration block's prefix is sentry's, byte for byte.
+//
+// Our module forwards with the same context pointer, and sentry's
+// read_registration() does a fixed-size read of sentry_wer_registration_t from
+// it, then derives the shared-memory name it reaches the daemon over. A field
+// inserted into the prefix silently stops that name matching, and nothing is
+// ever reported -- with every log line still saying the module was registered.
+static void check_wer_registration_prefix_is_asserted()
+{
+	auto header =
+		slurp("streamelements/StreamElementsWerRegistration.h");
+
+	check(header.find("static_assert(offsetof(SEWerRegistration, seMagic) == 16") !=
+		      std::string::npos,
+	      "CORE-864: the sentry-compatible prefix must be pinned by a static_assert, not by a comment");
+	check(header.find("app_tid") != std::string::npos,
+	      "CORE-864: the registration block must carry app_tid; the shared-memory name is derived from it");
+}
+
+
+// --- CORE-954: every value resolve.sh emits must be declared as an action output.
+//
+// A composite action exposes only the outputs it names. `emit foo` writes to
+// GITHUB_OUTPUT of the inner step, but if action.yml has no `foo:` block then
+// `steps.<id>.outputs.foo` evaluates to the empty string in the caller -- with
+// no warning, no error, and a workflow log that looks correct because
+// resolve.sh logs what it computed rather than what the caller received.
+//
+// That is not hypothetical. linear_base_tag was emitted from CORE-783 onward
+// and never declared, so `base_ref` was silently empty on every Linear sync for
+// months: the CLI fell back to its own scan base and each release held only its
+// own build's issues -- exactly the bug CORE-783 was filed to fix. It surfaced
+// only because a later step guarded on the output being non-empty and was
+// skipped.
+//
+// This is the general form of that gate rather than a check for one key: any
+// future `emit` that someone forgets to declare fails here instead.
+static void check_every_emitted_output_is_declared()
+{
+	auto action = slurp(".github/actions/se-release/action.yml");
+
+	// The declarations live under a top-level `outputs:` block; everything
+	// after it up to the next top-level key is what the action exposes.
+	auto outputs_at = action.find("\noutputs:");
+	check(outputs_at != std::string::npos,
+	      "CORE-954: se-release/action.yml must declare an outputs block");
+
+	if (outputs_at == std::string::npos)
+		return;
+
+	// The block ends at the next line that starts in column 0 and is not a
+	// comment -- `runs:` in practice.
+	std::string outputs = action.substr(outputs_at + 1);
+	std::regex next_top_level(R"(\n(?=[a-z][a-z-]*:))");
+	std::smatch m;
+
+	if (std::regex_search(outputs, m, next_top_level))
+		outputs = outputs.substr(0, m.position(0));
+
+	// Every `emit <key>` across the action's shell scripts.
+	static const char *const scripts[] = {
+		".github/actions/se-release/resolve.sh",
+		".github/actions/se-release/prevtag.sh",
+		".github/actions/se-release/publish.sh",
+		".github/actions/se-release/notes.sh",
+		".github/actions/se-release/changelog.sh",
+		".github/actions/se-release/attach-assets.sh",
+		".github/actions/se-release/dispatch.sh",
+	};
+
+	// Anchored on a line start without std::regex::multiline, which this
+	// MSVC does not provide. Group 2 is the key.
+	std::regex emit(R"((^|\n)[ \t]*emit[ \t]+([a-z_]+))");
+
+	std::size_t emitted = 0;
+
+	for (const char *script : scripts) {
+		std::string src;
+
+		try {
+			src = slurp(script);
+		} catch (...) {
+			continue; // a script may legitimately not exist
+		}
+
+		auto begin = std::sregex_iterator(src.begin(), src.end(), emit);
+		auto end = std::sregex_iterator();
+
+		for (auto it = begin; it != end; ++it) {
+			const std::string key = (*it)[2].str();
+
+			++emitted;
+
+			const bool declared =
+				outputs.find("\n  " + key + ":") !=
+				std::string::npos;
+
+			if (!declared) {
+				std::fprintf(stderr,
+					     "FAIL: CORE-954: '%s' is emitted by %s but not declared in se-release/action.yml, so the caller reads an empty string\n",
+					     key.c_str(), script);
+				++failures;
+			}
+		}
+	}
+
+	check(emitted > 0,
+	      "CORE-954: no emitted outputs were found at all -- the emit pattern or the script list has moved");
+}
+
+// --- CORE-954: the full release must adopt the issues of the releases it
+//     overtakes BEFORE any of them are cancelled.
+//
+// Cancelling a release whose issues were not taken over is the failure this
+// pair exists to prevent: the work shipped, but the release that delivered it
+// does not list it and the one that does is Canceled.
+static void check_full_release_adopts_before_cancelling()
+{
+	auto wf = slurp(".github/workflows/release.yml");
+
+	// The ids are matched with their trailing newline. Without it,
+	// find("id: linear_adopt") is satisfied by "id: linear_adopt_ANYTHING",
+	// so renaming the step away would leave this check passing.
+	auto adopt = wf.find("id: linear_adopt\n");
+	auto complete = wf.find("id: linear_complete\n");
+	auto cancel = wf.find("name: Cancel releases left open behind this one");
+
+	check(adopt != std::string::npos,
+	      "CORE-954: the full-release hop must adopt the overtaken releases' issues");
+	check(cancel != std::string::npos,
+	      "CORE-954: the cancel sweep must still exist");
+
+	if (adopt == std::string::npos || cancel == std::string::npos)
+		return;
+
+	check(adopt < cancel,
+	      "CORE-954: issues must be adopted BEFORE the releases holding them are cancelled");
+
+	if (complete != std::string::npos) {
+		// Completion fires the pipeline's rolloverIssuesOnCompletion
+		// and autoGenerateReleaseNotesOnCompletion, so the release has
+		// to be holding everything by then.
+		check(adopt < complete,
+		      "CORE-954: adoption must precede `complete`, which is what fires the pipeline's rollover and notes generation");
+	}
+
+	// The scan range is the whole point: the previous full release, not the
+	// previous build. A narrower base would cover none of the overtaken
+	// releases and the step would be decorative.
+	auto adopt_block = wf.substr(adopt, 1400);
+
+	// The whole `base_ref:` line, not just the output name: the step's own
+	// `if:` guard also mentions linear_base_tag, so a bare substring search
+	// stays true even when base_ref is repointed at a narrower tag.
+	check(adopt_block.find(
+		      "base_ref: ${{ steps.version.outputs.linear_base_tag }}") !=
+		      std::string::npos,
+	      "CORE-954: the adopt step must scan from linear_base_tag (the previous FULL release), or it covers none of the overtaken builds");
+
+	// And the sweep must not run if adoption did not.
+	auto cancel_block = wf.substr(cancel, 900);
+
+	check(cancel_block.find("steps.linear_adopt.outcome == 'success'") !=
+		      std::string::npos,
+	      "CORE-954: the cancel sweep must be gated on the adoption succeeding -- otherwise a failed adopt still retires the releases holding the issues");
+}
+
+// --- CORE-968: the WER gate's leading-frame skip must stay CONDITIONAL.
+//
+// Our frames being on the stack is not evidence the crash is ours -- when the
+// fault happens inside our handler they are there by construction (SELIVE-1Y,
+// where obs-websocket's destructor aborted and our handler died on its corrupt
+// heap). But skipping them unconditionally is just as wrong: a __fastfail
+// raised directly by our own code also has our frame innermost, and that is the
+// crash class this module exists to capture.
+//
+// Frame position cannot separate the two. Only seHandlerActive can, which is why
+// this check pins BOTH halves: the flag must be published by the handler, and
+// the module's skip must be derived from it rather than hard-coded either way.
+static void check_wer_skip_is_conditional_on_the_handler_flag()
+{
+	auto header = slurp("streamelements/StreamElementsWerRegistration.h");
+
+	check(header.find("DWORD seHandlerActive;") != std::string::npos,
+	      "CORE-968: the registration block must carry seHandlerActive");
+
+	auto handler =
+		slurp("streamelements/StreamElementsSentryCrashHandler.cpp");
+
+	check(handler.find("s_werRegistration.seHandlerActive = 1;") !=
+		      std::string::npos,
+	      "CORE-968: the crash handler must publish that it is on the stack");
+	check(handler.find("s_werRegistration.seHandlerActive = 0;") !=
+		      std::string::npos,
+	      "CORE-968: it must also clear the flag, or every later crash looks like one inside the handler");
+
+	auto module = slurp("streamelements/StreamElementsWerModule.cpp");
+
+	// The skip must be derived from the flag. Anchored on the assignment so
+	// that hard-coding it TRUE or FALSE -- the two ways to get this wrong --
+	// both fail here.
+	check(module.find(
+		      "BOOL skippingOwnLeadingFrames = registration->seHandlerActive") !=
+		      std::string::npos,
+	      "CORE-968: the skip must be conditional on seHandlerActive; hard-coding it FALSE reports other plug-ins' crashes as ours, and TRUE declines fast-fails raised by our own code");
+}
+
+// --- CORE-967: the consent prompt must not pump foreign messages.
+//
+// DialogBoxIndirectParamW runs the standard modal loop, which dispatches every
+// message queued for the thread. On a crash path that is fatal rather than
+// untidy: the fault that brought us here is frequently a half-destroyed widget,
+// and letting Qt repaint the main window inside the prompt touches it again.
+//
+// SELIVE-1Z is that loop, in production:
+//
+//   restoreState -> _purecall -> handler -> Prompt -> DispatchMessageWorker
+//     -> QWidgetRepaintManager::paintAndFlush -> _purecall AGAIN -> abort
+//
+// The second fault is on the same thread, nested inside the handler still
+// reporting the first, and kills the process mid-collection. s_insideExceptionFilter
+// cannot save it -- same thread, nothing to wait for.
+//
+// Measured before and after with a standalone harness: the DialogBox version
+// dispatched 202 foreign messages while the prompt was up; the isolated loop
+// dispatched 0, with the dialog behaving identically.
+static void check_consent_prompt_does_not_pump_foreign_messages()
+{
+	auto dialog = slurp("streamelements/StreamElementsCrashConsentDialog.cpp");
+
+	check(dialog.find("DialogBoxIndirectParamW(") == std::string::npos,
+	      "CORE-967: the prompt must not use DialogBoxIndirectParamW -- its modal loop dispatches Qt's messages and re-enters the crash");
+
+	check(dialog.find("RunIsolatedDialogLoop(dialog, state)") !=
+		      std::string::npos,
+	      "CORE-967: the prompt must be pumped by RunIsolatedDialogLoop, which dispatches only its own messages");
+
+	check(dialog.find("CreateDialogIndirectParamW(") != std::string::npos,
+	      "CORE-967: the dialog must be created modeless for that loop to drive it");
+
+	// The anti-spin measure. WM_PAINT is not consumed by GetMessage; it is
+	// regenerated until the update region is cleared, so discarding a
+	// foreign paint without validating it spins this loop at 100% CPU for
+	// as long as the prompt is up -- up to the five-minute CORE-862
+	// watchdog.
+	check(dialog.find("::ValidateRect(msg.hwnd, NULL)") != std::string::npos,
+	      "CORE-967: a discarded foreign WM_PAINT must be validated, or the isolated loop spins at 100% CPU");
+
+	// EndDialog only works for DialogBox*; leaving it behind would mean the
+	// prompt never closes and the watchdog kills the process every time.
+	check(dialog.find("::EndDialog(") == std::string::npos,
+	      "CORE-967: EndDialog does not end a modeless dialog -- the prompt would hang until the watchdog terminated the process");
+}
+
+// --- CORE-967: Qt::NoDockWidgetArea is not a valid addDockWidget() argument.
+//
+// checkDockWidgetArea() accepts only Left/Right/Top/Bottom. Anything else is
+// rejected with "QMainWindow::addDockWidget: invalid 'area' argument" and the
+// call returns having done nothing, so the dock is never registered in
+// QMainWindowLayout -- while the caller carries on treating it as though it
+// were, floating it and, in the worst version of this, draining the event queue
+// between two setFloating() calls.
+//
+// The layout is then inconsistent, and QMainWindow::restoreState() walks that
+// structure on the next scene-collection change. SELIVE-1Z faults there, in
+// QLayout::totalMinimumSize, on a pure virtual.
+//
+// This was not theoretical: every OBS log on an affected machine carried four of
+// those warnings per start. A portable A/B measured 1 before and 0 after (the
+// other three need SE.Live docks, which need a login).
+//
+// A floating dock is made by adding it to a real area and then floating it.
+static void check_no_dock_is_added_to_an_invalid_area()
+{
+	static const char *const sources[] = {
+		"streamelements/StreamElementsWidgetManager.cpp",
+		"streamelements/StreamElementsWorkerManager.cpp",
+		"streamelements/StreamElementsGlobalStateManager.cpp",
+		"streamelements/StreamElementsBrowserWidgetManager.cpp",
+	};
+
+	// Matches the argument as written at a call site, across the line break
+	// clang-format is fond of putting after the opening paren.
+	std::regex bad(R"(addDockWidget\(\s*Qt::NoDockWidgetArea)");
+
+	for (const char *src : sources) {
+		auto code = slurp(src);
+
+		if (std::regex_search(code, bad)) {
+			std::fprintf(stderr,
+				     "FAIL: CORE-967: %s calls addDockWidget(Qt::NoDockWidgetArea), which Qt rejects outright -- the dock is never added and the layout restoreState walks is left inconsistent\n",
+				     src);
+			++failures;
+		}
+	}
+
+	// The theme listener is a QDockWidget in the main window, so saveState()
+	// and restoreState() identify it by objectName. Qt requires one to be
+	// set for every dock in the window; this had none.
+	auto global = slurp("streamelements/StreamElementsGlobalStateManager.cpp");
+
+	check(global.find("m_themeChangeListener->setObjectName(") !=
+		      std::string::npos,
+	      "CORE-967: the theme-change dock must have an objectName -- saveState/restoreState identify docks by it");
+}
+
+// --- CORE-979: no config_t handle may escape through an early return.
+//
+// updater.cpp opens config_t handles and closes them at the bottom of the
+// function. Two `return` statements sat between an open and its close, and both
+// walked out with the handle still open:
+//
+//   prompt_for_update    -- the "Skip this version" path. skip_version is
+//                           sticky, so for anyone who has ever skipped a
+//                           version this leaked once per OBS start, forever.
+//   the manifest lambda  -- the "cannot update while streaming/recording"
+//                           path, which for a streaming tool is not an edge
+//                           case.
+//
+// The first is where the `reference count balance = 1 (0 is good)` logged at
+// every clean shutdown came from; a SETRACE level-2 dump named it outright:
+//
+//   + updater.cpp:467 : count(1) config   AddRefs (1), DecRefs (0)
+//
+// It is worth a static gate because the runtime signal is so easy to miss: it
+// needs ENABLE_SETRACE on, a clean shutdown, and someone reading the log --
+// and it does not reproduce at all on a fresh profile, where skip_version has
+// never been written and the early return is never taken.
+//
+// Walks the file in source order tracking which handles are open. Any `return`
+// reached while one is fails. Comments are stripped first, or the prose in the
+// fix ("this early return used to...") would trip the scan.
+static void check_no_config_handle_escapes_an_early_return()
+{
+	auto src = slurp("streamelements/updater/updater.cpp");
+
+	// Strip // comments line by line, then join. Joining is what lets the
+	// scan see a config_close(...) that clang-format has wrapped over three
+	// lines, as it does at the deeper indentation levels in this file.
+	std::string code;
+	std::istringstream lines(src);
+	std::string line;
+
+	while (std::getline(lines, line)) {
+		auto comment = line.find("//");
+
+		if (comment != std::string::npos)
+			line.erase(comment);
+
+		code += line;
+		code += ' ';
+	}
+
+	// Tokens of interest, matched in the order they appear.
+	std::regex token(
+		R"(config_open\s*\(\s*&\s*(\w+)|SETRACE_DECREF\s*\(\s*(\w+)|\breturn\b)");
+
+	std::vector<std::string> open;
+
+	for (auto it = std::sregex_iterator(code.begin(), code.end(), token);
+	     it != std::sregex_iterator(); ++it) {
+		const std::smatch &m = *it;
+
+		if (m[1].matched) {
+			open.push_back(m[1].str());
+			continue;
+		}
+
+		if (m[2].matched) {
+			auto found =
+				std::find(open.begin(), open.end(), m[2].str());
+
+			if (found != open.end())
+				open.erase(found);
+
+			continue;
+		}
+
+		// A return, with a handle still open.
+		if (!open.empty()) {
+			std::fprintf(
+				stderr,
+				"FAIL: CORE-979: updater.cpp returns with '%s' still open -- config_close it before leaving, or it leaks once per OBS start\n",
+				open.front().c_str());
+			++failures;
+
+			// Report each handle once; otherwise one missing close
+			// buries the output under every later return.
+			open.clear();
+		}
+	}
+}
+
+// --- The WYVRN SDK must never be built with its signature check disabled.
+//
+// deps/wyvrn-sdk/UnicodeWyvrnAPI.cpp reads
+// NO_CHECK_WYVRNSDK_LIBRARY_SIGNATURE, and defining it skips the Authenticode
+// verification that RzChromatic64.dll is signed by Razer -- on a DLL that is
+// then LoadLibrary'd into the OBS process. It is a debugging convenience in
+// Razer's sample that must not follow the code into a shipping build.
+//
+// Checked in CMakeLists.txt rather than in a source file, because that is
+// where such a define would plausibly be added: as an add_compile_definitions
+// or a target_compile_definitions entry alongside the vendored sources.
+static void check_wyvrn_signature_check_is_not_disabled()
+{
+	auto cmake = slurp("CMakeLists.txt");
+
+	std::regex bad(R"(NO_CHECK_WYVRNSDK_LIBRARY_SIGNATURE)");
+
+	// The comment in CMakeLists.txt naming the symbol is expected; a
+	// *define* of it is not. Match only the forms that would actually
+	// define it, so the explanatory comment does not trip the gate.
+	std::regex defined(
+		R"((add_compile_definitions|target_compile_definitions|add_definitions)\s*\([^)]*NO_CHECK_WYVRNSDK_LIBRARY_SIGNATURE)");
+
+	check(count_matches(cmake, defined) == 0,
+	      "WYVRN: CMakeLists.txt must never define NO_CHECK_WYVRNSDK_LIBRARY_SIGNATURE "
+	      "(it skips Authenticode verification of RzChromatic64.dll)");
+
+	// The vendored sources are meant to be unmodified, so the symbol must
+	// still only ever be *read* there, never defined.
+	auto sdk = slurp("deps/wyvrn-sdk/UnicodeWyvrnAPI.cpp");
+
+	std::regex sdk_defined(
+		R"(#\s*define\s+NO_CHECK_WYVRNSDK_LIBRARY_SIGNATURE)");
+
+	check(count_matches(sdk, sdk_defined) == 0,
+	      "WYVRN: deps/wyvrn-sdk/UnicodeWyvrnAPI.cpp must not define "
+	      "NO_CHECK_WYVRNSDK_LIBRARY_SIGNATURE");
+
+	// And the guard itself must still be there -- a vendored-source update
+	// that dropped the check entirely would otherwise pass silently.
+	check(count_matches(sdk, bad) >= 1,
+	      "WYVRN: deps/wyvrn-sdk/UnicodeWyvrnAPI.cpp no longer references "
+	      "NO_CHECK_WYVRNSDK_LIBRARY_SIGNATURE -- has the signature check been "
+	      "removed from the vendored SDK?");
+}
+
+// --- Scene-signal handler data must not be freed while it is still in use.
+//
+// Each scene has a child SESignalHandlerData, and every OBS signal on that
+// scene and its sources is connected with it. Its lifetime is a per-scene
+// count that groups fold into. libobs announces a group's removal but not
+// always its creation -- obs_scene_add_group(), which is how SE.Live creates
+// groups, emits no item_add -- so removing or ungrouping such a group took
+// back a count that was never added, and the scene's handler data was deleted
+// while its signals were still connected (CORE-1715, SELIVE-74/6C/6F/5M/4Y/
+// 4W/65/5T/44/3X). Reproduced in OBS with a script: 14 use-after-free calls
+// before the fix, 0 after.
+//
+// Asserts the fixed shape, each part of which was independently wrong:
+//   * a group's removal is only subtracted if its add was counted;
+//   * the retired child is deleted, and Release() called, outside the lock;
+//   * GetVideoCompositionId() answers from the root, because children never
+//     cache the id and every signal is connected with a child;
+//   * no queued task holds per-scene handler data or the raw signal pointer;
+//   * process_scene_item_remove reads what it needs before
+//     remove_scene_signals() can delete the handler data;
+//   * the scene-item dispatch never takes the composition fallback -- which
+//     walks OBS's scene QListWidget -- off the UI thread.
+static std::string function_body(const std::string &src,
+				 const std::string &marker)
+{
+	const auto begin = src.find(marker);
+	if (begin == std::string::npos)
+		return std::string();
+
+	const auto open = src.find('{', begin);
+	if (open == std::string::npos)
+		return std::string();
+
+	int depth = 0;
+	for (std::size_t i = open; i < src.size(); ++i) {
+		if (src[i] == '{')
+			++depth;
+		else if (src[i] == '}' && --depth == 0)
+			return src.substr(open, i - open + 1);
+	}
+
+	return std::string();
+}
+
+static void check_scene_signal_handler_lifetime()
+{
+	const std::string hpp = strip_line_comments(
+		slurp("streamelements/StreamElementsObsSceneManager.hpp"));
+	const std::string cpp = strip_line_comments(
+		slurp("streamelements/StreamElementsObsSceneManager.cpp"));
+
+	const std::string remove =
+		function_body(hpp, "void RemoveSceneRefAtRoot(");
+	check(!remove.empty(),
+	      "scene signals: SESignalHandlerData::RemoveSceneRefAtRoot() not "
+	      "found -- has the per-scene count moved? (CORE-1715)");
+
+	if (!remove.empty()) {
+		const auto groupCheck =
+			remove.find("m_groups_refcount.find(group)");
+		const auto decrement =
+			remove.find("--m_scenes_refcount[scene]");
+
+		check(groupCheck != std::string::npos &&
+			      decrement != std::string::npos &&
+			      groupCheck < decrement,
+		      "scene signals: RemoveSceneRefAtRoot() must check that a "
+		      "group's add was counted before subtracting it -- "
+		      "obs_scene_add_group() emits no item_add (CORE-1715)");
+
+		const auto del = remove.find("delete retired;");
+		const auto release = remove.find("Release();");
+		const auto lockScopeEnd = remove.find("m_scenes.erase(scene);");
+
+		check(del != std::string::npos &&
+			      release != std::string::npos &&
+			      lockScopeEnd != std::string::npos &&
+			      lockScopeEnd < del && del < release,
+		      "scene signals: RemoveSceneRefAtRoot() must delete the "
+		      "retired child and call Release() after the scene lock is "
+		      "released -- Release() can delete this object (CORE-1715)");
+	}
+
+	check(hpp.find("delete m_scenes[") == std::string::npos,
+	      "scene signals: a per-scene child is deleted in place "
+	      "(delete m_scenes[...]) -- retire it and delete it outside "
+	      "the lock (CORE-1715)");
+
+	const std::string compositionId =
+		function_body(hpp, "std::string GetVideoCompositionId()");
+	check(compositionId.find("m_parent->GetVideoCompositionId()") !=
+		      std::string::npos,
+	      "scene signals: GetVideoCompositionId() must forward to the root; "
+	      "children never cache the id, and every signal is connected "
+	      "with a child (CORE-1715)");
+
+	// No queued task may hold per-scene handler data or the raw signal
+	// pointer: a child is deleted without draining the queue.
+	const std::string enqueue = "EnqueueAsyncTask(";
+	std::size_t tasks = 0;
+	for (auto p = cpp.find(enqueue); p != std::string::npos;
+	     p = cpp.find(enqueue, p + 1)) {
+		const std::string task = function_body(cpp.substr(p), "[");
+		++tasks;
+
+		check(task.find("signalHandlerData") == std::string::npos &&
+			      task.find("my_data") == std::string::npos,
+		      "scene signals: a task queued with EnqueueAsyncTask() "
+		      "refers to signalHandlerData or my_data -- capture the "
+		      "root and resolved values instead (CORE-1715)");
+	}
+	check(tasks >= 2,
+	      "scene signals: expected the delayed scene-item and scene-update "
+	      "tasks in StreamElementsObsSceneManager.cpp (CORE-1715)");
+
+	const std::string itemRemove =
+		function_body(cpp, "static void process_scene_item_remove(");
+	const auto read = itemRemove.find("->m_obsSceneManager");
+	const auto removeGroup =
+		itemRemove.find("remove_scene_signals(group_scene");
+	check(read != std::string::npos && removeGroup != std::string::npos &&
+		      read < removeGroup,
+	      "scene signals: process_scene_item_remove() must read "
+	      "m_obsSceneManager before remove_scene_signals(), which can "
+	      "delete the handler data (CORE-1715)");
+
+	const std::string dispatch = function_body(
+		cpp,
+		"static void dispatch_sceneitem_event(const std::string "
+		"&compositionId,\n\t\t\t\t     obs_sceneitem_t *sceneitem,\n"
+		"\t\t\t\t     std::string eventName,");
+	const auto guard =
+		dispatch.find("if (!videoComposition && !onUiThread)");
+	const auto serialize = dispatch.find("SerializeSourceAndSceneItem(");
+	check(guard != std::string::npos && serialize != std::string::npos &&
+		      guard < serialize,
+	      "scene signals: the scene-item dispatch must not reach "
+	      "SerializeSourceAndSceneItem() with a null composition off the "
+	      "UI thread -- its fallback walks OBS's scene QListWidget "
+	      "(CORE-1715)");
+}
+
+// --- A dock leaves the paint tree before it is destroyed, and says so.
+//
+// Qt aborts in _purecall when a virtual call reaches an object whose vtable is
+// in the construction or destruction state: a widget painted while it is being
+// destroyed. QMainWindow::removeDockWidget() hides a dock but leaves it
+// parented, and destroying our browser widget spins a nested event loop inside
+// obs-browser's closeBrowser() -- which is exactly when a repaint can walk into
+// a half-destroyed widget (CORE-1922, SELIVE-8G; CORE-777 is the same
+// mechanism reached from the event queue).
+//
+// Two halves, both asserted here:
+//   * hide() and setParent(nullptr) run before either delete;
+//   * both destruction paths carry an SEWidgetTeardownScope, so a crash during
+//     one says which widget it was -- the whole point, since Qt ships no
+//     symbols and no StreamElements frame appears in these stacks.
+//
+// The browser widget's marker must also strip the URL's query string. Those
+// carry access tokens and this value ends up on a crash report.
+static void check_widget_teardown_leaves_the_paint_tree()
+{
+	const std::string utils = strip_line_comments(
+		slurp("streamelements/StreamElementsUtils.cpp"));
+
+	const std::string deleteDock =
+		function_body(utils, "void SEDeleteDockWidgetWhenSafe(");
+
+	check(!deleteDock.empty(),
+	      "widget teardown: SEDeleteDockWidgetWhenSafe() not found -- has "
+	      "dock destruction moved? Point this invariant at it (CORE-1922)");
+
+	if (!deleteDock.empty()) {
+		const auto hidden = deleteDock.find("dock->hide();");
+		const auto later = deleteDock.find("deleteLater();");
+		const auto now = deleteDock.find("delete dock.data();");
+		const auto marked = deleteDock.find("SEWidgetTeardownScope");
+
+		check(hidden != std::string::npos &&
+			      later != std::string::npos &&
+			      now != std::string::npos && hidden < later &&
+			      hidden < now,
+		      "widget teardown: the dock must be hidden before it is "
+		      "destroyed -- removeDockWidget() leaves it parented and a "
+		      "repaint can still reach it (CORE-1922)");
+
+		// The unparenting that matters is the one on the destroy path,
+		// not the one in the early-return branch above it -- which is
+		// why the count matters as much as the position: with only one,
+		// the early branch alone would satisfy this.
+		const auto unparented =
+			deleteDock.rfind("dock->setParent(nullptr);");
+		std::size_t unparentings = 0;
+		for (auto p = deleteDock.find("dock->setParent(nullptr);");
+		     p != std::string::npos;
+		     p = deleteDock.find("dock->setParent(nullptr);", p + 1))
+			++unparentings;
+
+		check(unparentings >= 2 && unparented != std::string::npos &&
+			      unparented < later && unparented < now,
+		      "widget teardown: the dock must be unparented before it is "
+		      "destroyed, so a repaint cannot walk into it (CORE-1922)");
+
+		check(marked != std::string::npos && marked < now,
+		      "widget teardown: the synchronous delete must carry an "
+		      "SEWidgetTeardownScope, or a crash during it cannot name "
+		      "the widget (CORE-1922)");
+	}
+
+	const std::string browser = strip_line_comments(
+		slurp("streamelements/StreamElementsBrowserWidget.cpp"));
+
+	const std::string destroy = function_body(
+		browser, "void StreamElementsBrowserWidget::DestroyBrowser()");
+
+	check(!destroy.empty(),
+	      "widget teardown: StreamElementsBrowserWidget::DestroyBrowser() "
+	      "not found (CORE-1922)");
+
+	if (!destroy.empty()) {
+		check(destroy.find("SEWidgetTeardownScope") !=
+			      std::string::npos,
+		      "widget teardown: DestroyBrowser() must carry an "
+		      "SEWidgetTeardownScope -- it spins a nested event loop, "
+		      "which is when the repaint that crashes runs (CORE-1922)");
+
+		check(destroy.find("find_first_of(\"?#\")") !=
+			      std::string::npos,
+		      "widget teardown: the marker must strip the URL's query "
+		      "string; those carry access tokens and this value is "
+		      "reported on a crash (CORE-1922)");
+	}
+
+	// And the crash path has to report it, or none of the above is visible.
+	const std::string context = strip_line_comments(
+		slurp("streamelements/StreamElementsCrashContext.cpp"));
+
+	check(context.find("selive.widget.destroying") != std::string::npos &&
+		      context.find("SEWidgetTeardownScope::Current()") !=
+			      std::string::npos,
+	      "widget teardown: the crash context must report "
+	      "selive.widget.destroying from SEWidgetTeardownScope::Current() "
+	      "(CORE-1922)");
+
+	const std::string sentry = strip_line_comments(
+		slurp("streamelements/StreamElementsSentryCrashHandler.cpp"));
+
+	check(sentry.find("selive.widget.destroying") != std::string::npos,
+	      "widget teardown: selive.widget.destroying must be tag-worthy, or "
+	      "it cannot be searched for in Sentry (CORE-1922)");
+}
+
+// --- Every WYVRN SDK entry point must be called from the SDK thread only.
+//
+// The Chroma stack beneath the SDK is COM-based and thread-affine: CoreInitSDK,
+// CoreSetEventName and CoreUnInit must all run on the same thread. The manager
+// guarantees that by confining them to ThreadProc(). A call added anywhere else
+// would compile, work most of the time, and fail as a rare crash on a user's
+// machine -- which is exactly what this gate exists to prevent.
+static void check_wyvrn_sdk_calls_stay_on_the_sdk_thread()
+{
+	auto src = slurp("streamelements/StreamElementsRazerWyvrnManager.cpp");
+
+	const std::string marker =
+		"void StreamElementsRazerWyvrnManager::ThreadProc()";
+	auto begin = src.find(marker);
+	check(begin != std::string::npos,
+	      "WYVRN: StreamElementsRazerWyvrnManager.cpp must define ThreadProc()");
+	if (begin == std::string::npos)
+		return;
+
+	// ThreadProc runs to the start of the next member definition.
+	auto end = src.find("\nStreamElementsRazerWyvrnManager::", begin);
+	auto end2 =
+		src.find("\nvoid StreamElementsRazerWyvrnManager::", begin + 1);
+	if (end2 != std::string::npos &&
+	    (end == std::string::npos || end2 < end))
+		end = end2;
+	if (end == std::string::npos)
+		end = src.size();
+
+	std::regex call(
+		R"(WyvrnSDK::WyvrnAPI::(CoreInitSDK|CoreSetEventName|CoreUnInit|InitAPI|UninitAPI))");
+
+	const std::size_t inside =
+		count_matches(src.substr(begin, end - begin), call);
+	const std::size_t total = count_matches(src, call);
+
+	check(total >= 5,
+	      "WYVRN: expected the SDK entry points to be called at all "
+	      "(CoreInitSDK / CoreSetEventName / CoreUnInit / InitAPI / UninitAPI)");
+
+	check(inside == total,
+	      "WYVRN: every WyvrnSDK::WyvrnAPI:: call must be inside ThreadProc() -- "
+	      "the SDK is thread-affine and must be entered only from the thread "
+	      "that ran CoreInitSDK");
+}
+
+// --- A null config_t must never reach libobs.
+//
+// GetConfig() ignored config_open()'s result. libobs leaves the config null
+// when it fails -- CONFIG_OPEN_ALWAYS creates the file, so a failure means the
+// directory could not be written at all -- and every accessor handed that
+// straight to libobs, which dereferences it at config->mutex without checking.
+// That is an access violation reading 0x18 on the start-up path, so OBS could
+// not finish launching: 30 users on 26.9.4.994 (CORE-1900, SELIVE-8A).
+//
+// Asserts the three halves of the fix:
+//   * GetConfig() checks the open result and bails out before it touches the
+//     config;
+//   * SaveConfig() skips the in-memory fallback, which has no file and would
+//     otherwise be written into the process working directory;
+//   * no accessor passes GetConfig() straight to a libobs config_* call, and
+//     every null-safe helper actually tests the pointer.
+static void check_config_never_hands_libobs_a_null_config()
+{
+	const std::string cpp = strip_line_comments(
+		slurp("streamelements/StreamElementsConfig.cpp"));
+	const std::string hpp = strip_line_comments(
+		slurp("streamelements/StreamElementsConfig.hpp"));
+
+	const std::string getConfig = function_body(
+		cpp, "config_t* StreamElementsConfig::GetConfig()");
+
+	check(!getConfig.empty(),
+	      "config: StreamElementsConfig::GetConfig() not found -- has it "
+	      "moved? Point this invariant at it (CORE-1900)");
+
+	if (!getConfig.empty()) {
+		const auto opened = getConfig.find("config_open(");
+		const auto tested = getConfig.find("CONFIG_SUCCESS");
+		const auto bailed = getConfig.find("return nullptr;");
+		const auto used = getConfig.find("config_set_default_");
+
+		check(opened != std::string::npos &&
+			      tested != std::string::npos && tested > opened,
+		      "config: GetConfig() must check config_open()'s result -- "
+		      "libobs leaves the config null when it fails (CORE-1900)");
+
+		check(bailed != std::string::npos &&
+			      used != std::string::npos && bailed < used,
+		      "config: GetConfig() must return before it uses a config "
+		      "it could not open (CORE-1900)");
+	}
+
+	const std::string saveConfig =
+		function_body(cpp, "void StreamElementsConfig::SaveConfig()");
+
+	check(saveConfig.find("m_configIsMemoryOnly") != std::string::npos,
+	      "config: SaveConfig() must skip the in-memory fallback, which has "
+	      "no file -- config_save_safe() would write .tmp and .bak into the "
+	      "working directory (CORE-1900)");
+
+	// The trim that reads index -1 when the path comes back empty.
+	check(cpp.find("[strlen(") == std::string::npos,
+	      "config: a path is trimmed with [strlen(...) - 1], which writes to "
+	      "index -1 when the path is empty -- measure it into a variable and "
+	      "test it first (CORE-1900)");
+
+	// Every accessor goes through the null-safe helpers instead. The
+	// helpers call GetConfig() themselves, so what is banned is GetConfig()
+	// appearing inside a libobs config_* call's arguments.
+	for (const char *call : {"config_get_", "config_set_"}) {
+		for (auto p = hpp.find(call); p != std::string::npos;
+		     p = hpp.find(call, p + 1)) {
+			// The call's own argument list, to its closing paren.
+			const auto open = hpp.find('(', p);
+			std::string args;
+			int depth = 0;
+
+			for (auto i = open;
+			     i != std::string::npos && i < hpp.size(); ++i) {
+				if (hpp[i] == '(')
+					++depth;
+				else if (hpp[i] == ')' && --depth == 0)
+					break;
+
+				args.push_back(hpp[i]);
+			}
+
+			check(args.find("GetConfig()") == std::string::npos,
+			      "config: an accessor in StreamElementsConfig.hpp "
+			      "passes GetConfig() to libobs directly; libobs "
+			      "does not null-check it. Use the Read*/Write* "
+			      "helpers (CORE-1900)");
+		}
+	}
+
+	const char *helpers[] = {"ReadUint",  "ReadBool",  "ReadString",
+				 "WriteUint", "WriteBool", "WriteString"};
+
+	for (const char *helper : helpers) {
+		const std::string body =
+			function_body(hpp, std::string(" ") + helper +
+						   "(const char *section");
+
+		check(!body.empty(),
+		      (std::string("config: the null-safe helper ") + helper +
+		       "() is missing from StreamElementsConfig.hpp (CORE-1900)")
+			      .c_str());
+
+		if (body.empty())
+			continue;
+
+		// Each one must test the config before using it: a read returns
+		// its default, a write does nothing.
+		const bool guarded =
+			body.find("config ?") != std::string::npos ||
+			body.find("if (config)") != std::string::npos;
+
+		check(guarded,
+		      (std::string("config: ") + helper +
+		       "() must check the config for null before handing it to "
+		       "libobs (CORE-1900)")
+			      .c_str());
+	}
+}
+
+// --- A rejected file-server request must stop, not fall through.
+//
+// StreamElementsLocalFilesystemHttpServer verifies a session signature before
+// serving an absolute path. The rejection branch originally had no `return`: it
+// set 429 and a JSON body, then carried on to open the file, attach a content
+// provider for its bytes, and reset the status to 200. The bytes did not escape
+// -- set_content had already claimed the body -- but that was cpp-httplib's
+// precedence protecting the check rather than the check protecting anything,
+// and the descriptor opened on that path leaked once per rejected request.
+//
+// This is the local file server that getAllRazerWyvrnEvents hands signed URLs
+// into, so the guard matters at scale.
+static void check_rejected_signature_stops_the_handler()
+{
+	auto src = slurp(
+		"streamelements/StreamElementsLocalFilesystemHttpServer.cpp");
+
+	auto begin = src.find("if (!VerifySessionSignedAbsolutePathURL(");
+	check(begin != std::string::npos,
+	      "file server: the session signature check must still be present");
+	if (begin == std::string::npos)
+		return;
+
+	// The rejection block ends at the first closing brace at that
+	// indentation; a `return` must appear before it.
+	auto end = src.find("\n\t\t}", begin);
+	check(end != std::string::npos,
+	      "file server: could not find the end of the signature check block");
+	if (end == std::string::npos)
+		return;
+
+	const std::string block = src.substr(begin, end - begin);
+
+	std::regex ret(R"(\breturn\s*;)");
+	check(count_matches(block, ret) >= 1,
+	      "file server: the invalid-signature branch must return -- without it "
+	      "the handler falls through, opens the file, and resets the status to 200");
+}
+
+// --- The crash path must never use a throwing std::filesystem overload.
+//
+// StreamElementsCrashContext::Collect() walked the profile with a range-for
+// over recursive_directory_iterator and the one-argument is_directory(). A
+// folder that vanished mid-walk -- CEF churns its cache directories, and a
+// crashing process is exactly when that is in flight -- threw
+// filesystem_error inside the crash handler. Nothing caught it, so the
+// handler aborted itself and the report of the original crash was replaced
+// by its own (CORE-1714, SELIVE-5M).
+//
+// Checked across every crash-path source file, not just the one that bit:
+//   * no range-for over a directory iterator (its operator++ throws);
+//   * no directory-iterator variable advanced with ++;
+//   * every call to a throwing std::filesystem operation passes an
+//     std::error_code that is declared in the same file;
+//   * no zero-argument directory_entry query (.is_directory() and friends).
+static std::vector<std::string> top_level_args(const std::string &s,
+					       std::size_t open)
+{
+	std::vector<std::string> args;
+	std::string cur;
+	int depth = 0;
+
+	for (std::size_t i = open; i < s.size(); ++i) {
+		const char c = s[i];
+
+		if (c == '(') {
+			if (depth++ == 0)
+				continue;
+		} else if (c == ')') {
+			if (--depth == 0) {
+				args.push_back(cur);
+				return args;
+			}
+		} else if (c == ',' && depth == 1) {
+			args.push_back(cur);
+			cur.clear();
+			continue;
+		}
+
+		cur.push_back(c);
+	}
+
+	return {}; // unbalanced: treat as no arguments
+}
+
+static std::string trim(const std::string &s)
+{
+	const auto b = s.find_first_not_of(" \t\r\n");
+	if (b == std::string::npos)
+		return std::string();
+	const auto e = s.find_last_not_of(" \t\r\n");
+	return s.substr(b, e - b + 1);
+}
+
+static bool is_ident_char(char c)
+{
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool is_space(char c)
+{
+	return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
+static std::vector<std::size_t> find_all(const std::string &code,
+					 const std::string &needle)
+{
+	std::vector<std::size_t> hits;
+	for (auto p = code.find(needle); p != std::string::npos;
+	     p = code.find(needle, p + 1))
+		hits.push_back(p);
+	return hits;
+}
+
+static void check_crash_path_filesystem_calls_never_throw()
+{
+	const char *files[] = {
+		"streamelements/StreamElementsCrashContext.cpp",
+		"streamelements/StreamElementsCrashHandler.cpp",
+		"streamelements/StreamElementsSentryCrashHandler.cpp",
+		"streamelements/StreamElementsSentryCrashHandler.mm",
+		"streamelements/StreamElementsBugSplatCrashHandler.cpp",
+		"streamelements/StreamElementsBugSplatCrashHandler.mm",
+		"streamelements/StreamElementsWerModule.cpp",
+		"streamelements/StreamElementsCrashConsentDialog.cpp",
+		"streamelements/StreamElementsCrashConsentDialog.mm",
+	};
+
+	// Operations whose default overload reports failure by throwing.
+	const char *throwingOps[] = {
+		"is_directory",
+		"is_regular_file",
+		"is_symlink",
+		"exists",
+		"file_size",
+		"status",
+		"symlink_status",
+		"remove",
+		"remove_all",
+		"create_directory",
+		"create_directories",
+		"copy",
+		"copy_file",
+		"rename",
+		"last_write_time",
+		"absolute",
+		"canonical",
+		"weakly_canonical",
+		"temp_directory_path",
+		"space",
+		"equivalent",
+		"hard_link_count",
+		"resize_file",
+		"permissions",
+		"read_symlink",
+		"relative",
+		"proximate",
+		"directory_iterator",
+		"recursive_directory_iterator",
+	};
+
+	// directory_entry queries whose zero-argument form throws.
+	const char *entryQueries[] = {
+		"is_directory",   "is_regular_file", "is_symlink",
+		"exists",         "file_size",       "status",
+		"symlink_status", "last_write_time",
+	};
+
+	const std::string ns = "std::filesystem::";
+
+	for (const char *relpath : files) {
+		const std::string code = strip_line_comments(slurp(relpath));
+
+		// Plain find() rather than regexes over whole files: MSVC's
+		// std::regex made this one check cost ~90 s. A file that never
+		// mentions std::filesystem has nothing to check -- and skipping
+		// it also keeps the member-query check below from flagging
+		// unrelated types' .exists().
+		if (code.find("filesystem") == std::string::npos)
+			continue;
+
+		const std::string where = std::string("crash path: ") + relpath;
+
+		std::vector<std::string> errorCodes;
+		for (auto p : find_all(code, "std::error_code")) {
+			std::size_t i = p + std::strlen("std::error_code");
+			while (i < code.size() && is_space(code[i]))
+				++i;
+			const std::size_t b = i;
+			while (i < code.size() && is_ident_char(code[i]))
+				++i;
+			if (i > b)
+				errorCodes.push_back(code.substr(b, i - b));
+		}
+
+		for (auto p : find_all(code, ns)) {
+			std::size_t i = p + ns.size();
+			const std::size_t b = i;
+			while (i < code.size() && is_ident_char(code[i]))
+				++i;
+			const std::string name = code.substr(b, i - b);
+
+			bool throwing = false;
+			for (const char *op : throwingOps)
+				if (name == op)
+					throwing = true;
+			if (!throwing)
+				continue;
+
+			const bool isIterator =
+				name == "directory_iterator" ||
+				name == "recursive_directory_iterator";
+
+			while (i < code.size() && is_space(code[i]))
+				++i;
+
+			// `recursive_directory_iterator walk(` names a variable.
+			std::string var;
+			if (isIterator) {
+				const std::size_t vb = i;
+				while (i < code.size() &&
+				       is_ident_char(code[i]))
+					++i;
+				var = code.substr(vb, i - vb);
+				while (i < code.size() && is_space(code[i]))
+					++i;
+			}
+
+			// A type mention or default construction, not a call.
+			if (i >= code.size() || code[i] != '(')
+				continue;
+
+			if (isIterator && var.empty()) {
+				std::size_t k = p;
+				while (k > 0 && is_space(code[k - 1]))
+					--k;
+				const bool rangeFor =
+					k >= 1 && code[k - 1] == ':' &&
+					(k < 2 || code[k - 2] != ':');
+
+				check(!rangeFor,
+				      (where +
+				       " iterates a directory with a "
+				       "range-for; its operator++ throws -- "
+				       "advance with increment(ec) instead "
+				       "(CORE-1714)")
+					      .c_str());
+			}
+
+			bool passesErrorCode = false;
+			for (const auto &arg : top_level_args(code, i))
+				for (const auto &ec : errorCodes)
+					if (trim(arg) == ec)
+						passesErrorCode = true;
+
+			check(passesErrorCode,
+			      (where + " calls 'std::filesystem::" + name +
+			       "(...)' without an std::error_code, so a "
+			       "filesystem error throws inside the crash handler "
+			       "(CORE-1714)")
+				      .c_str());
+
+			if (var.empty())
+				continue;
+
+			// A named iterator must advance with increment(ec).
+			for (auto q : find_all(code, var)) {
+				const std::size_t e = q + var.size();
+				if ((q > 0 && is_ident_char(code[q - 1])) ||
+				    (e < code.size() && is_ident_char(code[e])))
+					continue;
+
+				std::size_t a = q;
+				while (a > 0 && is_space(code[a - 1]))
+					--a;
+				std::size_t z = e;
+				while (z < code.size() && is_space(code[z]))
+					++z;
+
+				const bool pre = a >= 2 &&
+						 code.compare(a - 2, 2, "++") ==
+							 0;
+				const bool post = z + 2 <= code.size() &&
+						  code.compare(z, 2, "++") == 0;
+
+				check(!pre && !post,
+				      (where +
+				       " advances directory iterator '" + var +
+				       "' with ++, which throws -- use "
+				       "increment(ec) (CORE-1714)")
+					      .c_str());
+			}
+		}
+
+		// entry.is_directory() and friends, called with no arguments.
+		for (const char *query : entryQueries) {
+			const std::string call = std::string(query) + "(";
+			for (auto p : find_all(code, call)) {
+				if (p > 0 && is_ident_char(code[p - 1]))
+					continue; // the tail of a longer name
+
+				std::size_t a = p;
+				while (a > 0 && is_space(code[a - 1]))
+					--a;
+				if (a == 0 || code[a - 1] != '.')
+					continue; // not a member call
+
+				std::size_t z = p + call.size();
+				while (z < code.size() && is_space(code[z]))
+					++z;
+
+				check(z >= code.size() || code[z] != ')',
+				      (where + " calls ." + query +
+				       "() with no arguments, which throws -- "
+				       "pass an std::error_code (CORE-1714)")
+					      .c_str());
+			}
+		}
+	}
+
+	// Not vacuous: the profile walk this guards must still exist.
+	const std::string context = strip_line_comments(
+		slurp("streamelements/StreamElementsCrashContext.cpp"));
+	check(context.find("directory_iterator") != std::string::npos,
+	      "crash path: StreamElementsCrashContext.cpp no longer walks a "
+	      "directory -- has the profile walk moved? Point this invariant "
+	      "at it (CORE-1714)");
+}
+
+// --- CORE-1601: every CefParseJSON result must be null-checked before it is
+// dereferenced.
+//
+// CefParseJSON returns nullptr for anything it cannot parse
+// (deps/cef-stub/cef_value_json.cpp), and CefRefPtr is std::shared_ptr in this
+// codebase, so calling through the result is a hard dereference of null.
+//
+// Scope, stated plainly so this does not become the next check_c5: the scan
+// below sees a dereference IN THE SAME FUNCTION as the parse. It cannot
+// follow a value handed to a callee that dereferences it, so the two sites
+// of that shape are asserted by name afterwards. Both halves were confirmed
+// by reintroducing each bug and watching this test fail.
+//
+// check_c5_cefparsejson_null_guarded() above already claimed to cover this, but
+// it reads one variable in one file. That is why RestoreState shipped with the
+// bug anyway: it dereferenced the result one line BEFORE its guard, in a file
+// nothing was watching, and crashed every launch for any user whose persisted
+// state had been corrupted. This scans every production .cpp instead, so the
+// pattern cannot reappear somewhere unwatched.
+static void check_cefparsejson_results_are_guarded_everywhere()
+{
+	namespace fs = std::filesystem;
+
+	const fs::path root = fs::path(se_tests::kRepoRoot) / "streamelements";
+
+	std::size_t scanned = 0;
+	std::size_t guarded_sites = 0;
+
+	for (const auto &entry : fs::recursive_directory_iterator(root)) {
+		if (!entry.is_regular_file())
+			continue;
+
+		const fs::path path = entry.path();
+		if (path.extension() != ".cpp")
+			continue;
+
+		// Vendored third-party, including CefParseJSON's own definition.
+		if (path.string().find("deps") != std::string::npos)
+			continue;
+
+		std::ifstream in(path);
+		std::stringstream ss;
+		ss << in.rdbuf();
+
+		// Comments are stripped first. They would otherwise sit
+		// between the parse and the use and push the dereference
+		// past the window below, so the check would skip the site
+		// silently -- which is exactly how a regression gate stops
+		// being one. Found by deleting the guard while leaving its
+		// comment in place and watching this test still pass.
+		const std::string src = strip_line_comments(ss.str());
+
+		++scanned;
+
+		// std::regex over every production source costs seconds; a
+		// plain substring test first keeps this check in the
+		// milliseconds the rest of the file runs in.
+		if (src.find("CefParseJSON") == std::string::npos)
+			continue;
+
+		for (std::size_t call = src.find("CefParseJSON");
+		     call != std::string::npos;
+		     call = src.find("CefParseJSON", call + 1)) {
+			const std::size_t from = call > 160 ? call - 160 : 0;
+			const std::string before =
+				src.substr(from, call - from);
+
+			// Bind the call to the variable it is assigned to.
+			//
+			// Done by hand rather than with a `$`-anchored regex,
+			// because MSVC's std::regex matches `$` at every line
+			// end rather than only at end of input. An anchored
+			// pattern therefore bound the call to whichever earlier
+			// line happened to end in `=` - which is a real shape
+			// here, e.g. `CefRefPtr<CefListValue> callArgs =` - and
+			// reported a false violation against an unrelated
+			// variable.
+			const std::size_t eq =
+				before.find_last_not_of(" \t\r\n");
+			if (eq == std::string::npos || eq == 0 ||
+			    before[eq] != '=')
+				continue; // not bound to a named variable
+
+			// `==`, `!=`, `>=` and friends are comparisons.
+			const char prev = before[eq - 1];
+			if (prev == '=' || prev == '!' || prev == '<' ||
+			    prev == '>' || prev == '+' || prev == '-' ||
+			    prev == '*' || prev == '/' || prev == '%' ||
+			    prev == '&' || prev == '|' || prev == '^')
+				continue;
+
+			const std::size_t idEnd =
+				before.find_last_not_of(" \t\r\n", eq - 1);
+			if (idEnd == std::string::npos)
+				continue;
+
+			std::size_t idBegin = idEnd + 1;
+			while (idBegin > 0) {
+				const unsigned char c =
+					static_cast<unsigned char>(
+						before[idBegin - 1]);
+				if (!std::isalnum(c) && c != '_')
+					break;
+				--idBegin;
+			}
+
+			if (idBegin > idEnd)
+				continue;
+
+			const std::string var =
+				before.substr(idBegin, idEnd - idBegin + 1);
+
+			// Far enough to reach the guard and the first use; a
+			// site that defers use beyond this is not the shape
+			// this invariant is about.
+			const std::string window = src.substr(call, 600);
+
+			const std::size_t deref = window.find(var + "->");
+			if (deref == std::string::npos)
+				continue;
+
+			// Every null-test shape this codebase actually uses.
+			const std::string forms[] = {
+				"!" + var + ".get()", "!" + var + " ",
+				"!" + var + ")",      var + ".get() &&",
+				var + " &&",          var + " != nullptr",
+				var + " == nullptr",  var + ".get() ==",
+				var + ".get() !=",
+			};
+
+			std::size_t guard = std::string::npos;
+			for (const std::string &form : forms) {
+				const std::size_t at = window.find(form);
+				if (at < guard)
+					guard = at;
+			}
+
+			if (guard == std::string::npos || guard > deref) {
+				const std::string msg =
+					"CORE-1601: " +
+					path.filename().string() +
+					": CefParseJSON result '" + var +
+					"' is dereferenced before it is null-checked";
+				check(false, msg.c_str());
+			} else {
+				++guarded_sites;
+			}
+		}
+	}
+
+	// Guards against the scan silently covering nothing - a wrong root path
+	// or a regex that stopped matching would otherwise read as a pass.
+	check(scanned > 10,
+	      "CORE-1601: expected to scan the production sources for CefParseJSON");
+	check(guarded_sites >= 3,
+	      "CORE-1601: expected the known guarded CefParseJSON dereferences to be found");
+
+	// The two sites that hand the parsed value to an overload which
+	// dereferences it, rather than dereferencing it here. The scan above
+	// cannot see across that call, so they are named.
+	const struct {
+		const char *file;
+		const char *callee;
+	} handedOn[] = {
+		{"streamelements/StreamElementsBrowserWidgetManager.cpp",
+		 "DeserializeNotificationBar"},
+		{"streamelements/StreamElementsWidgetManager.cpp",
+		 "DeserializeDockingWidgets"},
+	};
+
+	for (const auto &site : handedOn) {
+		const std::string src = slurp(site.file);
+
+		const std::regex guarded(
+			std::string(
+				R"(CefParseJSON[\s\S]{0,300}?if\s*\(\s*!root\.get\(\)[\s\S]{0,200}?)") +
+			site.callee + R"(\s*\(\s*root\s*\))");
+
+		const std::string msg =
+			std::string("CORE-1601: ") + site.file +
+			": the CefParseJSON result must be null-checked before it is handed to " +
+			site.callee;
+
+		check(count_matches(src, guarded) >= 1, msg.c_str());
 	}
 }
 
@@ -144,8 +2355,40 @@ int main()
 	check_c2_video_encoder_template_match();
 	check_c4_no_self_assign_cefclientid();
 	check_c5_cefparsejson_null_guarded();
+	check_cefparsejson_results_are_guarded_everywhere();
 	check_c6_audio_encoder_bounds();
 	check_c10_no_duplicate_handler_setcurrentprofile();
+	check_menu_manager_update_guarded();
+	check_widget_manager_dtor_does_not_drain_events();
+	check_widget_maps_hold_qpointer();
+	check_event_pumps_are_counted();
+	check_dock_deletion_is_gated();
+	check_obs_close_is_watched();
+	check_both_sentry_doors_are_owned();
+	check_abort_path_drops_own_frames();
+	check_sentry_init_is_diagnosable();
+	check_queued_tasks_suppressed_during_crash();
+	check_oom_handler_observes_and_chains();
+	check_guard_buffer_released_first();
+	check_consent_prompt_is_bounded();
+	check_encoder_released_once_per_object();
+	check_scene_signal_handler_lifetime();
+	check_sentry_wer_is_not_beside_the_host_executable();
+	check_wer_module_gates_before_forwarding();
+	check_prompt_discloses_automatic_reports();
+	check_wer_registration_prefix_is_asserted();
+	check_every_emitted_output_is_declared();
+	check_full_release_adopts_before_cancelling();
+	check_wer_skip_is_conditional_on_the_handler_flag();
+	check_consent_prompt_does_not_pump_foreign_messages();
+	check_no_dock_is_added_to_an_invalid_area();
+	check_widget_teardown_leaves_the_paint_tree();
+	check_no_config_handle_escapes_an_early_return();
+	check_wyvrn_signature_check_is_not_disabled();
+	check_wyvrn_sdk_calls_stay_on_the_sdk_thread();
+	check_config_never_hands_libobs_a_null_config();
+	check_rejected_signature_stops_the_handler();
+	check_crash_path_filesystem_calls_never_throw();
 
 	if (failures) {
 		std::fprintf(stderr, "%d source invariant(s) violated\n",

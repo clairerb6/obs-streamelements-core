@@ -26,6 +26,8 @@
 #include <curl/curl.h>
 
 #include <QMenu>
+#include <QDockWidget>
+#include <QPointer>
 #include <QWidget>
 
 #define SYNC_ACCESS()                                                    \
@@ -44,6 +46,27 @@
 /* ========================================================= */
 
 bool IsTraceLogLevel();
+
+/* ========================================================= */
+
+//
+// Set by the crash handler for as long as it is reporting a crash, and never
+// cleared -- a process that has faulted is not going back to normal service.
+//
+// The consent prompt is modal, and a modal dialog on either platform runs a
+// nested message loop that keeps draining this process's own event queue. So
+// work queued before the fault -- including host API calls -- executes inside
+// the crash handler, on the thread that just crashed. Observed on macOS: a
+// second `crashProgram` call was delivered into the NSAlert's modal loop,
+// faulted again, and because the SDK's signal handler ignores a re-entrant
+// crash the faulting instruction simply re-executed forever. OBS hung at 100%
+// CPU with the dialog frozen behind a spinning beachball.
+//
+// Anything that can run application code from an event loop should consult
+// this and decline.
+//
+void SetCrashReportingInProgress();
+bool IsCrashReportingInProgress();
 
 /* ========================================================= */
 
@@ -93,21 +116,25 @@ class StreamElementsApiContext_t
 	: public std::list<std::shared_ptr<StreamElementsApiContextItem>> {
 public:
 	StreamElementsApiContext_t() {}
-	~StreamElementsApiContext_t()
-	{
-		clear();
-	}
+	~StreamElementsApiContext_t() { clear(); }
 };
 
 void GetApiContext(std::function<void(StreamElementsApiContext_t *)> callback);
-std::shared_ptr<StreamElementsApiContextItem> PushApiContext(CefString method, CefRefPtr<CefListValue> args);
+
+// Non-blocking variant for the crash path; false means the lock was held
+// and the callback did not run. See the definition for why.
+bool TryGetApiContext(
+	std::function<void(StreamElementsApiContext_t *)> callback);
+std::shared_ptr<StreamElementsApiContextItem>
+PushApiContext(CefString method, CefRefPtr<CefListValue> args);
 void RemoveApiContext(std::shared_ptr<StreamElementsApiContextItem> item);
 
 /* ========================================================= */
 
 class StreamElementsAsyncCallContextItem {
 public:
-	StreamElementsAsyncCallContextItem(std::string& file_, int line_, bool running_)
+	StreamElementsAsyncCallContextItem(std::string &file_, int line_,
+					   bool running_)
 		: file(file_), line(line_), running(running_)
 	{
 #if _WIN32
@@ -124,30 +151,36 @@ public:
 	bool running = false;
 };
 
-class StreamElementsAsyncCallContextStack_t : public
-	std::list<std::shared_ptr<StreamElementsAsyncCallContextItem>> {
+class StreamElementsAsyncCallContextStack_t
+	: public std::list<std::shared_ptr<StreamElementsAsyncCallContextItem>> {
 public:
 	StreamElementsAsyncCallContextStack_t() {}
-	~StreamElementsAsyncCallContextStack_t()
-	{
-		clear();
-	}
+	~StreamElementsAsyncCallContextStack_t() { clear(); }
 };
 
 void GetAsyncCallContextStack(
 	std::function<void(const StreamElementsAsyncCallContextStack_t *)>
 		callback);
 
-std::shared_ptr<StreamElementsAsyncCallContextItem> AsyncCallContextPush(std::string file, int line, bool running);
+// Non-blocking variant for the crash path; false means the lock was held and
+// the callback did not run. See the definition for why.
+bool TryGetAsyncCallContextStack(
+	std::function<void(const StreamElementsAsyncCallContextStack_t *)>
+		callback);
+
+std::shared_ptr<StreamElementsAsyncCallContextItem>
+AsyncCallContextPush(std::string file, int line, bool running);
 void AsyncCallContextRemove(
 	std::shared_ptr<StreamElementsAsyncCallContextItem> item);
 
 class SEAsyncCallContextMarker {
 private:
-	std::shared_ptr<StreamElementsAsyncCallContextItem> m_contextItem = nullptr;
+	std::shared_ptr<StreamElementsAsyncCallContextItem> m_contextItem =
+		nullptr;
 
 public:
-	SEAsyncCallContextMarker(const char *file, const int line, bool running = true)
+	SEAsyncCallContextMarker(const char *file, const int line,
+				 bool running = true)
 	{
 		m_contextItem = AsyncCallContextPush(file, line, running);
 	}
@@ -175,7 +208,8 @@ private:
 	call_t impl;
 
 public:
-	QtAsyncCallFunctor(const char* file_, const int line_, const call_t impl_)
+	QtAsyncCallFunctor(const char *file_, const int line_,
+			   const call_t impl_)
 		: file(file_), line(line_), impl(impl_)
 	{
 	}
@@ -186,11 +220,113 @@ public:
 	}
 };
 
-std::future<void> __QtDelayTask_Impl(std::function<void()> task, int delayMs, const char* file, const int line);
+std::future<void> __QtDelayTask_Impl(std::function<void()> task, int delayMs,
+				     const char *file, const int line);
 
-#define QtDelayTask(task, delayMs) __QtDelayTask_Impl(task, delayMs, __FILE__, __LINE__)
+#define QtDelayTask(task, delayMs) \
+	__QtDelayTask_Impl(task, delayMs, __FILE__, __LINE__)
 #define QtPostTask QtAsyncCallFunctor(__FILE__, __LINE__, &__QtPostTask_Impl)
 #define QtExecSync QtAsyncCallFunctor(__FILE__, __LINE__, &__QtExecSync_Impl)
+
+/* ========================================================= */
+
+//
+// UI teardown gate (CORE-786). Defined in obs-streamelements-core-plugin.cpp,
+// which is where the detection lives; see the long comment there.
+//
+// False once OBS has been asked to close before our Initialize() completed --
+// the update-thread race. In that state our object graph is half-built and
+// destroying any of it corrupts the widget tree, so every UI teardown site
+// must check this first.
+//
+bool SEIsUiTeardownSafe();
+
+// Called at the end of Initialize(). After this, an ordinary close is an
+// ordinary close and teardown proceeds normally.
+void SENoteInitializeCompleted();
+
+// False while Initialize() is on the stack, and after a close has been caught.
+// Defined in obs-streamelements-core-plugin.cpp.
+bool SEIsEventPumpAllowed();
+
+// Use instead of QApplication::sendPostedEvents() everywhere: one choke point
+// for every event pump the plug-in runs.
+void SEDrainEventQueue();
+
+// The only sanctioned way to destroy a QDockWidget. Deletes it when the gate
+// above is open; otherwise detaches it from OBS's widget tree and leaks it,
+// loudly. Destroying a dock while OBSInit() is still on the stack corrupts
+// the tree, and by then obs_frontend_get_main_window() may already be null.
+void SEDeleteDockWidgetWhenSafe(QPointer<QDockWidget> dock, const char *id,
+				bool useDeleteLater);
+
+//
+// Names the widget currently being destroyed, for whatever crash report the
+// process produces while that is true.
+//
+// Qt aborts in _purecall when a virtual call reaches an object whose vtable is
+// in the construction or destruction state -- a widget painted while it is
+// being destroyed. We have 22 of those across 19 users on 26.9.4.994
+// (SELIVE-8G) and cannot tell whether the widget is ours: Qt ships no PDBs in
+// anything OBS publishes, so the frames above _purecall are unresolved, and no
+// StreamElements frame appears in the stack at all.
+//
+// So the process records what it was doing instead. The crash context reads
+// Current() and, when it says something, reports it as
+// selive.widget.destroying. If those events start carrying it, the crash is
+// ours and names the widget; if they never do, it is not ours (CORE-1922).
+//
+// Header-only on purpose: the crash context is compiled only when a crash
+// backend is enabled, and this has to exist in every configuration that has
+// widgets to destroy.
+//
+// The storage is a fixed buffer written without allocating and read without a
+// lock. The reader runs on a dying process, possibly on this very thread a few
+// frames deeper: a torn read costs one garbled attribute, while a lock would
+// risk the crash handler waiting on the code that just crashed.
+//
+class SEWidgetTeardownScope {
+public:
+	SEWidgetTeardownScope(const char *kind, const char *id)
+	{
+		snprintf(m_previous, sizeof(m_previous), "%s", Buffer());
+
+		snprintf(Buffer(), kBufferSize, "%s:%s",
+			 kind ? kind : "(unnamed)", id ? id : "(unnamed)");
+	}
+
+	~SEWidgetTeardownScope()
+	{
+		// Restored rather than cleared: destroying a dock destroys the
+		// widget inside it, so these nest, and the outer one is still
+		// true afterwards.
+		snprintf(Buffer(), kBufferSize, "%s", m_previous);
+	}
+
+	SEWidgetTeardownScope(const SEWidgetTeardownScope &) = delete;
+	SEWidgetTeardownScope &
+	operator=(const SEWidgetTeardownScope &) = delete;
+
+	// Empty when nothing is being destroyed. snprintf always terminates, so
+	// this is always a valid C string.
+	static const char *Current() { return Buffer(); }
+
+private:
+	static const size_t kBufferSize = 160;
+
+	// Zero-initialised before any dynamic initialisation runs, so it is
+	// readable from the first instruction of the process.
+	static char *Buffer()
+	{
+		static char buffer[kBufferSize] = {0};
+
+		return buffer;
+	}
+
+	char m_previous[kBufferSize];
+};
+
+/* ========================================================= */
 
 std::string DockWidgetAreaToString(const Qt::DockWidgetArea area);
 std::string GetCommandLineOptionValue(const std::string key);
@@ -220,7 +356,8 @@ void SerializeAvailableInputSourceTypes(
 	std::vector<obs_source_type> requiredSourceTypes,
 	bool serializeProperties);
 void SerializeExistingInputSources(
-	CefRefPtr<CefValue> &output, uint32_t requireAnyOfOutputFlagsMask, uint32_t requireOutputFlagsMask,
+	CefRefPtr<CefValue> &output, uint32_t requireAnyOfOutputFlagsMask,
+	uint32_t requireOutputFlagsMask,
 	std::vector<obs_source_type> requireSourceTypes,
 	bool serializeProperties);
 
@@ -248,8 +385,8 @@ typedef std::function<bool(void *data, size_t datalen, void *userdata,
 typedef std::function<void(char *data, void *userdata, char *error_msg,
 			   int http_code)>
 	http_client_string_callback_t;
-typedef std::function<void(void *data, size_t datalen, void *userdata, char *error_msg,
-			   int http_code)>
+typedef std::function<void(void *data, size_t datalen, void *userdata,
+			   char *error_msg, int http_code)>
 	http_client_buffer_callback_t;
 typedef std::multimap<std::string, std::string> http_client_headers_t;
 
@@ -402,12 +539,12 @@ private:
 	std::recursive_mutex mutex;
 
 public:
-	static std::shared_ptr<CancelableTask> Execute(std::function<void(std::shared_ptr<CancelableTask>)> task) {
+	static std::shared_ptr<CancelableTask>
+	Execute(std::function<void(std::shared_ptr<CancelableTask>)> task)
+	{
 		auto handle = std::make_shared<CancelableTask>();
 
-		std::thread thread([handle, task]() {
-			task(handle);
-		});
+		std::thread thread([handle, task]() { task(handle); });
 
 		thread.detach();
 
@@ -415,21 +552,12 @@ public:
 	}
 
 public:
-	CancelableTask()
-		: cancelled(false)
-	{
-	}
+	CancelableTask() : cancelled(false) {}
 
 public:
-	void Cancel()
-	{
-		cancelled = true;
-	}
+	void Cancel() { cancelled = true; }
 
-	bool IsCancelled()
-	{
-		return cancelled;
-	}
+	bool IsCancelled() { return cancelled; }
 };
 
 /* ========================================================= */
@@ -438,8 +566,7 @@ typedef std::function<void(bool success, void *, size_t)>
 	async_http_request_callback_t;
 
 std::shared_ptr<CancelableTask>
-HttpGetAsync(std::string url,
-		async_http_request_callback_t callback);
+HttpGetAsync(std::string url, async_http_request_callback_t callback);
 
 /* ========================================================= */
 
@@ -499,14 +626,26 @@ void DispatchClientMessage(std::string target,
 			   CefRefPtr<CefProcessMessage> msg);
 
 void DispatchJSEventContainer(std::string target, std::string event,
-			   std::string eventArgsJson);
+			      std::string eventArgsJson);
 
 void DispatchJSEventGlobal(std::string event, std::string eventArgsJson);
+
+//
+// True once teardown has begun and the Qt main thread has left its event loop
+// for good.
+//
+// From that moment a cross-thread QtExecSync can never be served: the thread it
+// is waiting for is inside our own shutdown and will not process another
+// posted task. Anything still blocking on one deadlocks the shutdown it is
+// blocking (CORE-1131).
+//
+bool IsShuttingDown();
+void SetShuttingDown();
 
 /* ========================================================= */
 
 bool SecureJoinPaths(std::string base, std::string subpath,
-			    std::string &result);
+		     std::string &result);
 
 /* ========================================================= */
 
@@ -555,7 +694,7 @@ private:
 	std::string m_slug;
 
 public:
-	SELazyOBSVideoEncoderAllocatorBase(std::string slug): m_slug(slug) {}
+	SELazyOBSVideoEncoderAllocatorBase(std::string slug) : m_slug(slug) {}
 	virtual ~SELazyOBSVideoEncoderAllocatorBase() {}
 
 	virtual obs_encoder_t *AllocRef() = 0;
@@ -604,7 +743,8 @@ public:
 	};
 
 public:
-	class ExternallyAllocatedEncoderAllocator : public SELazyOBSVideoEncoderAllocatorBase {
+	class ExternallyAllocatedEncoderAllocator
+		: public SELazyOBSVideoEncoderAllocatorBase {
 	private:
 		struct Private {};
 
@@ -613,17 +753,21 @@ public:
 
 	public:
 		static std::shared_ptr<ExternallyAllocatedEncoderAllocator>
-		Create(obs_encoder_t* externallyAllocatedObject)
+		Create(obs_encoder_t *externallyAllocatedObject)
 		{
 			if (!externallyAllocatedObject)
 				return nullptr;
-			return std::make_shared<ExternallyAllocatedEncoderAllocator>(
+			return std::make_shared<
+				ExternallyAllocatedEncoderAllocator>(
 				Private{}, externallyAllocatedObject);
 		}
 
 		ExternallyAllocatedEncoderAllocator(
 			Private, obs_encoder_t *externallyAllocatedObject)
-			: SELazyOBSVideoEncoderAllocatorBase(FormatString("externallyAllocatedObject: %s", GetIdFromPointer(externallyAllocatedObject).c_str()))
+			: SELazyOBSVideoEncoderAllocatorBase(FormatString(
+				  "externallyAllocatedObject: %s",
+				  GetIdFromPointer(externallyAllocatedObject)
+					  .c_str()))
 		{
 			m_externallyAllocatedObject = SETRACE_ADDREF(
 				obs_encoder_get_ref(externallyAllocatedObject));
@@ -639,13 +783,14 @@ public:
 			}
 		}
 
-		virtual obs_encoder_t* AllocRef() override {
+		virtual obs_encoder_t *AllocRef() override
+		{
 			return obs_encoder_get_ref(m_externallyAllocatedObject);
 		}
 
 		virtual void Reset() override {}
 
-		virtual obs_data_t* GetSettingsRef() override
+		virtual obs_data_t *GetSettingsRef() override
 		{
 			return obs_encoder_get_settings(
 				m_externallyAllocatedObject);
@@ -653,7 +798,8 @@ public:
 
 		virtual std::string GetId() const override
 		{
-			const auto id = obs_encoder_get_id(m_externallyAllocatedObject);
+			const auto id =
+				obs_encoder_get_id(m_externallyAllocatedObject);
 
 			if (id)
 				return id;
@@ -663,7 +809,8 @@ public:
 
 		virtual std::string GetName() const override
 		{
-			const auto name = obs_encoder_get_name(m_externallyAllocatedObject);
+			const auto name = obs_encoder_get_name(
+				m_externallyAllocatedObject);
 
 			if (name)
 				return name;
@@ -672,7 +819,8 @@ public:
 		}
 	};
 
-	class CreateEncoderAllocator : public SELazyOBSVideoEncoderAllocatorBase {
+	class CreateEncoderAllocator
+		: public SELazyOBSVideoEncoderAllocatorBase {
 	private:
 		struct Private {};
 
@@ -692,15 +840,17 @@ public:
 		       video_t *video)
 		{
 			return std::make_shared<CreateEncoderAllocator>(
-				Private{}, id, name, settings, hotkeys, width, height, video);
+				Private{}, id, name, settings, hotkeys, width,
+				height, video);
 		}
 
- 		CreateEncoderAllocator(Private, std::string id,
+		CreateEncoderAllocator(Private, std::string id,
 				       std::string name, obs_data_t *settings,
 				       obs_data_t *hotkeys, uint32_t width,
 				       uint32_t height, video_t *video)
-			: SELazyOBSVideoEncoderAllocatorBase(
-				  FormatString("CreateEncoderAllocator: [%d x %d] %s - %s", width, height, id.c_str(), name.c_str()))
+			: SELazyOBSVideoEncoderAllocatorBase(FormatString(
+				  "CreateEncoderAllocator: [%d x %d] %s - %s",
+				  width, height, id.c_str(), name.c_str()))
 		{
 			m_id = id;
 			m_name = name;
@@ -758,10 +908,9 @@ public:
 
 		virtual obs_encoder_t *AllocRef() override
 		{
-			auto created_encoder =
-				obs_video_encoder_create(
-					m_id.c_str(), m_name.c_str(),
-					m_settings, m_hotkeys);
+			auto created_encoder = obs_video_encoder_create(
+				m_id.c_str(), m_name.c_str(), m_settings,
+				m_hotkeys);
 
 			if (!created_encoder) {
 				blog(LOG_ERROR,
@@ -796,13 +945,13 @@ public:
 
 		virtual void Reset() override {}
 
-		virtual obs_data_t *
-		GetSettingsRef() override
+		virtual obs_data_t *GetSettingsRef() override
 		{
 			obs_data_t *result = obs_data_create();
 
 			if (m_id.size() > 0) {
-				OBSDataAutoRelease defaults = obs_encoder_defaults(m_id.c_str());
+				OBSDataAutoRelease defaults =
+					obs_encoder_defaults(m_id.c_str());
 
 				obs_data_apply(result, defaults);
 			}
@@ -814,15 +963,9 @@ public:
 			return result;
 		}
 
-		virtual std::string GetId() const override
-		{
-			return m_id;
-		}
+		virtual std::string GetId() const override { return m_id; }
 
-		virtual std::string GetName() const override
-		{
-			return m_name;
-		}
+		virtual std::string GetName() const override { return m_name; }
 	};
 
 private:
@@ -832,7 +975,8 @@ private:
 	int m_refCount = 0;
 	obs_encoder_t *m_object = nullptr;
 
-	std::shared_ptr<SELazyOBSVideoEncoderAllocatorBase> m_allocator = nullptr;
+	std::shared_ptr<SELazyOBSVideoEncoderAllocatorBase> m_allocator =
+		nullptr;
 
 public:
 	SELazyOBSVideoEncoderProvider(
@@ -875,7 +1019,8 @@ public:
 	{
 		auto shared = this->shared_from_this();
 
-		return std::make_shared<SELazyOBSVideoEncoderProvider::SELazyOBSEncoderReference>(
+		return std::make_shared<
+			SELazyOBSVideoEncoderProvider::SELazyOBSEncoderReference>(
 			shared);
 	}
 
@@ -938,9 +1083,7 @@ public:
 	}
 
 protected:
-	inline obs_encoder_t *GetPtr() const {
-		return m_object;
-	}
+	inline obs_encoder_t *GetPtr() const { return m_object; }
 
 private:
 	void AddConsumer()
@@ -963,7 +1106,6 @@ private:
 	{
 		std::unique_lock lock(m_mutex);
 
-		ReleaseRef(m_object);
 		--m_refCount;
 
 		if (m_refCount <= 0 && m_object) {
@@ -971,6 +1113,29 @@ private:
 			     "[obs-streamelements-core]: error: SELazyOBSVideoEncoderProvider::RemoveConsumer calling allocator->Reset(): (refCount: %d, object: %s): %s",
 			     m_refCount, GetIdFromPointer(m_object).c_str(),
 			     slug().c_str());
+
+			//
+			// Release here, and only here (CORE-865).
+			//
+			// This used to run unconditionally, above the guard. But
+			// AddConsumer only takes a reference for the FIRST
+			// consumer -- it is guarded by `if (!m_object)` -- so
+			// releasing once per consumer meant one acquire against
+			// N releases.
+			//
+			// Several providers share a single obs_encoder_t: an
+			// allocator's AllocRef() resolves to another provider's
+			// object and takes its own reference on it. In the
+			// reported crash one encoder was wrapped by three
+			// providers and another by four. So the second consumer
+			// to leave dropped the encoder's count to zero, libobs
+			// destroyed it, and m_object was left dangling for
+			// everyone still holding it -- the next release wrote
+			// through freed memory inside obs_encoder_release.
+			//
+			// Acquire once per object, release once per object.
+			//
+			ReleaseRef(m_object);
 
 			m_allocator->Reset();
 
@@ -985,12 +1150,12 @@ private:
 	}
 
 protected:
-	obs_encoder_t* AddRef(obs_encoder_t* object)
+	obs_encoder_t *AddRef(obs_encoder_t *object)
 	{
 		return SETRACE_ADDREF(obs_encoder_get_ref(object));
 	}
 
-	void ReleaseRef(obs_encoder_t* object)
+	void ReleaseRef(obs_encoder_t *object)
 	{
 		obs_encoder_release(SETRACE_DECREF(object));
 	}

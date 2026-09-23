@@ -178,10 +178,27 @@ Section "section_main" section_main
     Delete "$INSTDIR\obs-plugins\64bit\obs-streamelements-core_qt6.dll"
     Delete "$INSTDIR\obs-plugins\64bit\obs-streamelements-core_qt6.pdb"
 
+    # Both backends' runtimes are removed regardless of which one this build
+    # ships. An upgrade that switches backends would otherwise leave the
+    # previous install's files on disk forever -- a stale BugSplat64.dll next
+    # to a Sentry build, or the reverse.
     Delete "$INSTDIR\bin\64bit\BsSndRpt64.exe"
     Delete "$INSTDIR\bin\64bit\BugSplat64.dll"
     Delete "$INSTDIR\bin\64bit\BugSplatHD64.exe"
     Delete "$INSTDIR\bin\64bit\BugSplatRc64.dll"
+    Delete "$INSTDIR\obs-plugins\64bit\sentry-crash.exe"
+
+    # The WER runtime exception modules (CORE-864).
+    Delete "$INSTDIR\obs-plugins\64bit\se-crash-wer.dll"
+    Delete "$INSTDIR\obs-plugins\64bit\sentry-wer.dll"
+
+    # And the per-user allow-list entry that let WerFault load ours. The plug-in
+    # writes this on every start, keyed by the DLL's full path, and deliberately
+    # does not remove it at shutdown -- a crash during OBS's own teardown should
+    # still be caught. So this is the only place it is ever cleaned up. Harmless
+    # if left (WER only consults it for a process that registered the module),
+    # but it would otherwise name a DLL that no longer exists, forever.
+    DeleteRegValue HKCU "Software\Microsoft\Windows\Windows Error Reporting\RuntimeExceptionHelperModules" "$INSTDIR\obs-plugins\64bit\se-crash-wer.dll"
 
     Delete "$INSTDIR\obs-plugins\32bit\obs-streamelements.qt5.dymod"
     Delete "$INSTDIR\obs-plugins\32bit\obs-streamelements.qt5.pdb"
@@ -218,6 +235,9 @@ Section "section_main" section_main
     Delete "$INSTDIR\bin\32bit\BugSplat.dll"
     Delete "$INSTDIR\bin\32bit\BugSplatHD.exe"
     Delete "$INSTDIR\bin\32bit\BugSplatRc.dll"
+    # No 32-bit Sentry build exists, but these lines exist to clean up what a
+    # *previous* install left behind, so the pair stays symmetrical with 64-bit.
+    Delete "$INSTDIR\obs-plugins\32bit\sentry-crash.exe"
 
     Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
     DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_CODE_NAME}"
